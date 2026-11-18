@@ -15,7 +15,7 @@ Clear-Host
 
 # =============================================================================
 #   BSMM ANTI-CHEAT  -  PC Check
-#   Run before the match. The live monitor is the separate BSMM-Monitor.ps1 script.
+#   Run whenever BSMM staff ask for a PC check. The live monitor is the separate BSMM-Monitor.ps1 script.
 #
 #   BRAND SETTINGS: edit this block to restyle the whole tool.
 #   Colours are hex (#RRGGBB). "Fallback" is one of the 16 classic console
@@ -6212,7 +6212,7 @@ Read-BsmmContinue 'Continue to step 2: Process Explorer'
 Write-StepHeader -Step 2
 Out-Seg ''
 Out-Card -Title 'What to do' -Numbered -Lines @(
-    'Process Explorer opens full screen. Leave it open for a few seconds so the whole process list is on the recording.',
+    'Process Explorer opens full screen. Leave it open for a few seconds so staff can see the whole process list.',
     'If the list does not fit on one screen, scroll through it slowly.',
     'Close Process Explorer (File > Exit). This window waits for it and then continues.'
 )
@@ -6240,8 +6240,8 @@ Out-Seg 'PC CHECK COMPLETE' -Fg 'Text' -Bold -NoNewline
 Out-Seg ("   TRUST $($script:SystemTrust.Score)/100  $($script:SystemTrust.Label)") -Fg $script:SystemTrust.Token -Bold -NoNewline
 Out-Seg "   report $($script:ReportId)" -Fg 'Muted'
 Out-Seg ''
-Out-Card -Title 'Next' -Numbered -Lines @(
-    'Keep recording.',
-    'Open a new PowerShell window as administrator and start the BSMM live monitor before you join the match.'
+Out-Card -Title 'Done' -Lines @(
+    'Show this screen to BSMM staff and keep this window open until they have seen it.',
+    "Staff can find this check in Discord under report $($script:ReportId)."
 )
 Out-Seg ''

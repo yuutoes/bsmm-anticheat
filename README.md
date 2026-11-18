@@ -7,24 +7,27 @@ There are two scripts:
 
 | Script | When | What it does |
 |---|---|---|
-| `BSMM-Check.ps1` | Before you join the match | 62 system checks, then opens Process Explorer for the recording |
-| `BSMM-Monitor.ps1` | During the match | Watches for suspicious activity until you press Ctrl+C |
+| `BSMM-Check.ps1` | Whenever staff ask for a PC check, for example if a player is suspected of cheating | Scans the PC for cheats, recent cheat use and signs of a cleanup, then opens Process Explorer |
+| `BSMM-Monitor.ps1` | During a match, when staff want a player watched | Watches for suspicious activity until you press Ctrl+C |
 
 ## How to run
 
-Open **PowerShell as administrator** (right-click > Run as administrator) and run:
+Open **PowerShell as administrator** (right-click > Run as administrator).
+
+**PC check**, when staff ask for one:
 
 ```powershell
 iex (iwr "https://raw.githubusercontent.com/yuutoes/bsmm-anticheat/main/BSMM-Check.ps1" -UseBasicParsing).Content
 ```
 
-Before joining the match, open a second admin PowerShell window for the live monitor:
+**Live monitor**, if staff ask you to run it during a match (in its own admin window):
 
 ```powershell
 iex (iwr "https://raw.githubusercontent.com/yuutoes/bsmm-anticheat/main/BSMM-Monitor.ps1" -UseBasicParsing).Content
 ```
 
-Both ask for your Roblox username and show a **report ID** on screen. Keep both visible on your recording.
+Both ask for your Roblox username and show a **report ID** on screen. Keep the window visible to
+staff (screen share or recording) until they have seen the result.
 
 ## What it checks
 
@@ -62,6 +65,12 @@ The checks only read. The script itself:
 
 ## For BSMM staff
 
+- **Getting the most out of a PC check:** have the player run it straight away, before they can
+  close or delete anything, ideally with Roblox still open (memory readers, injected modules and
+  overlays are only visible while they run), and always as administrator (without it the run
+  history checks see nothing).
+- A PC that looks clean but shows wiped run history, cleared event logs or a reset change journal
+  should be treated as suspicious. Windows run history only goes back about a week.
 - `relay/` holds the relay that keeps the Discord webhook secret. Setup steps: `relay/SETUP.md`.
 - Shared settings (brand, colours, relay address, trust score weights, cheat names) are at the top
   of **both** scripts. Change them in both.
