@@ -1,14 +1,25 @@
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 
+# Undo (and remember) any alias/function that shadows a command this check relies on: a fake
+# Get-Process or Where-Object defined beforehand could otherwise hide results.
+$script:PreDefaultParams = 0
+try { $script:PreDefaultParams = @($global:PSDefaultParameterValues.Keys).Count } catch {}
 $script:PSDefaultParameterValues = @{}
+$script:PreRemovedOverrides = @()
 foreach ($__n in @(
     'Invoke-WebRequest','Invoke-RestMethod','Invoke-Expression','Test-Path','Get-Item',
     'Get-ChildItem','Get-ItemProperty','Get-ItemPropertyValue','Get-CimInstance','Get-WmiObject',
     'Get-Process','Start-Process','Get-Service','Get-WinEvent','Get-AuthenticodeSignature',
-    'Get-Module','New-Item','Remove-Item','Add-Content'
+    'Get-Module','New-Item','Remove-Item','Add-Content','Get-Content','Get-Command','Write-Host',
+    'Read-Host','Where-Object','ForEach-Object','Select-Object','Sort-Object','Measure-Object',
+    'Out-Null','Get-Date','Out-String','Select-String','ConvertFrom-Json','ConvertTo-Json','Start-Sleep'
 )) {
-    Microsoft.PowerShell.Management\Remove-Item -Path "Alias:\$__n"    -Force -ErrorAction SilentlyContinue
-    Microsoft.PowerShell.Management\Remove-Item -Path "Function:\$__n" -Force -ErrorAction SilentlyContinue
+    foreach ($__kind in @('Alias', 'Function')) {
+        if (Microsoft.PowerShell.Management\Test-Path -LiteralPath "$($__kind):\$__n") {
+            $script:PreRemovedOverrides += "$($__kind.ToLower()) $__n"
+            Microsoft.PowerShell.Management\Remove-Item -LiteralPath "$($__kind):\$__n" -Force -ErrorAction SilentlyContinue
+        }
+    }
 }
 
 Clear-Host
@@ -25,7 +36,7 @@ $script:Brand = @{
     Name    = 'BSMM'
     Product = 'Anti-Cheat'
     Mode    = 'PC check'
-    Version = '1.0.0'
+    Version = '1.1.0'
     Website = ''                     # optional, e.g. 'discord.gg/yourserver' - shown beside the logo
 }
 
@@ -57,7 +68,11 @@ $script:Report = @{
 
 # --- League policy -----------------------------------------------------------
 $script:Policy = @{
-    MaxUptimeMinutes = 0         # e.g. 10 = warn if the PC was not restarted shortly before the check. 0 = off
+    MaxUptimeMinutes       = 0        # e.g. 10 = warn if the PC was not restarted shortly before the check. 0 = off
+    RequireSecureBoot      = $false   # $true = Secure Boot off is a FAIL (blocks boot-level cheats; ~95% of gaming PCs have it)
+    RequireDriverBlocklist = $false   # $true = Vulnerable Driver Blocklist off is a FAIL (blocks the usual kernel-cheat loader)
+    RequireMemoryIntegrity = $false   # $true = Memory Integrity (HVCI) off is a FAIL (strongest; can cost a few % FPS)
+    DeepHistory            = $true    # read Amcache + SRUM through a temporary shadow copy (~30 days of history, adds ~10-30 s)
 }
 
 # --- Trust score (starts at 100, these are subtracted) ------------------------
@@ -5844,6 +5859,7 @@ function Get-BsmmSystemFacts {
     } catch {}
     $admin = $false; try { $admin = Test-Admin } catch {}
     $facts['Admin'] = $(if ($admin) { 'Yes' } else { 'NO - checks incomplete' })
+    if ($script:CodeFingerprint) { $facts['Code'] = $script:CodeFingerprint }
     return $facts
 }
 
@@ -5949,6 +5965,1289 @@ function Get-BsmmLivePayload {
             timestamp = (Get-Date).ToUniversalTime().ToString('o')
         })
     }
+}
+
+# =============================================================================
+#   BSMM forensic engine (C#): process memory strings, USN change journal,
+#   multi-pattern file/memory fingerprinting, PE section names, app hives.
+#   Compiled on first use. Written for the C# 5 compiler in Windows PowerShell 5.1.
+# =============================================================================
+$script:BsmmForensicsSource = @'
+using System;
+using System.Collections.Generic;
+using System.IO;
+using System.Runtime.InteropServices;
+using System.Text;
+using System.Text.RegularExpressions;
+using Microsoft.Win32;
+using Microsoft.Win32.SafeHandles;
+
+namespace BSMM
+{
+    public class UsnEntry
+    {
+        public DateTime Time;
+        public uint Reason;
+        public string Name;
+        public string Path;
+        public ulong Frn;
+        public ulong ParentFrn;
+        public bool IsDir;
+    }
+
+    public class UsnInfo
+    {
+        public bool Ok;
+        public string Error;
+        public ulong JournalId;
+        public long FirstUsn;
+        public long NextUsn;
+        public ulong MaximumSize;
+        public DateTime OldestRecord;
+        public long RecordsRead;
+    }
+
+    // Aho-Corasick automaton over bytes. Every needle is searched as ASCII and as UTF-16LE.
+    public class Matcher
+    {
+        private int[] delta;
+        private ulong[] masks;
+
+        public Matcher(string[] needles)
+        {
+            if (needles.Length > 64) throw new ArgumentException("at most 64 needles");
+            var pats = new List<KeyValuePair<byte[], int>>();
+            for (int i = 0; i < needles.Length; i++)
+            {
+                pats.Add(new KeyValuePair<byte[], int>(Encoding.ASCII.GetBytes(needles[i]), i));
+                pats.Add(new KeyValuePair<byte[], int>(Encoding.Unicode.GetBytes(needles[i]), i));
+            }
+            var go = new List<int[]>();
+            var outs = new List<ulong>();
+            go.Add(NewRow()); outs.Add(0);
+            foreach (var p in pats)
+            {
+                int s = 0;
+                foreach (byte b in p.Key)
+                {
+                    if (go[s][b] < 0) { go.Add(NewRow()); outs.Add(0); go[s][b] = go.Count - 1; }
+                    s = go[s][b];
+                }
+                outs[s] |= (1UL << p.Value);
+            }
+            int n = go.Count;
+            int[] fail = new int[n];
+            delta = new int[n * 256];
+            masks = new ulong[n];
+            var queue = new Queue<int>();
+            masks[0] = outs[0];
+            for (int c = 0; c < 256; c++)
+            {
+                int t = go[0][c];
+                if (t < 0) { delta[c] = 0; }
+                else { delta[c] = t; fail[t] = 0; queue.Enqueue(t); }
+            }
+            while (queue.Count > 0)
+            {
+                int r = queue.Dequeue();
+                masks[r] = outs[r] | masks[fail[r]];
+                for (int c = 0; c < 256; c++)
+                {
+                    int t = go[r][c];
+                    if (t < 0) { delta[r * 256 + c] = delta[fail[r] * 256 + c]; }
+                    else { fail[t] = delta[fail[r] * 256 + c]; delta[r * 256 + c] = t; queue.Enqueue(t); }
+                }
+            }
+        }
+
+        private static int[] NewRow()
+        {
+            int[] row = new int[256];
+            for (int i = 0; i < 256; i++) row[i] = -1;
+            return row;
+        }
+
+        public ulong Scan(byte[] buf, int len, ref int state)
+        {
+            ulong hits = 0;
+            int s = state;
+            int[] d = delta;
+            ulong[] m = masks;
+            for (int i = 0; i < len; i++)
+            {
+                s = d[(s << 8) | buf[i]];
+                hits |= m[s];
+            }
+            state = s;
+            return hits;
+        }
+    }
+
+    public static class Forensics
+    {
+        const uint PROCESS_QUERY_INFORMATION = 0x0400;
+        const uint PROCESS_VM_READ = 0x0010;
+        const uint MEM_COMMIT = 0x1000;
+        public const uint MEM_PRIVATE = 0x20000;
+        public const uint MEM_MAPPED = 0x40000;
+        public const uint MEM_IMAGE = 0x1000000;
+
+        [StructLayout(LayoutKind.Sequential)]
+        struct MBI
+        {
+            public IntPtr BaseAddress;
+            public IntPtr AllocationBase;
+            public uint AllocationProtect;
+            public IntPtr RegionSize;
+            public uint State;
+            public uint Protect;
+            public uint Type;
+        }
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        static extern IntPtr OpenProcess(uint access, bool inherit, int pid);
+        [DllImport("kernel32.dll", SetLastError = true)]
+        static extern bool CloseHandle(IntPtr h);
+        [DllImport("kernel32.dll", SetLastError = true)]
+        static extern bool ReadProcessMemory(IntPtr h, IntPtr addr, byte[] buf, IntPtr size, out IntPtr read);
+        [DllImport("kernel32.dll", SetLastError = true)]
+        static extern IntPtr VirtualQueryEx(IntPtr h, IntPtr addr, out MBI info, IntPtr len);
+        [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+        static extern SafeFileHandle CreateFile(string name, uint access, uint share, IntPtr sec, uint disposition, uint flags, IntPtr template);
+        [DllImport("kernel32.dll", SetLastError = true)]
+        static extern bool DeviceIoControl(SafeFileHandle h, uint code, byte[] inBuf, int inSize, byte[] outBuf, int outSize, out int returned, IntPtr overlapped);
+        [DllImport("advapi32.dll", CharSet = CharSet.Unicode)]
+        static extern int RegLoadAppKey(string file, out IntPtr hkResult, int samDesired, int options, int reserved);
+        [StructLayout(LayoutKind.Sequential)]
+        struct FILE_ID_DESCRIPTOR { public int dwSize; public int Type; public long FileId; public long Pad; }
+        [DllImport("kernel32.dll", SetLastError = true)]
+        static extern SafeFileHandle OpenFileById(SafeFileHandle volumeHint, ref FILE_ID_DESCRIPTOR id, uint access, uint share, IntPtr sec, uint flags);
+        [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+        static extern uint GetFinalPathNameByHandle(SafeFileHandle h, StringBuilder buf, uint len, uint flags);
+
+        delegate void ChunkHandler(byte[] buf, int len);
+
+        static bool Readable(uint protect)
+        {
+            if ((protect & 0x100) != 0 || (protect & 0x01) != 0) return false;   // GUARD / NOACCESS
+            return (protect & 0xEE) != 0;
+        }
+
+        static string WalkMemory(int pid, uint typeMask, long maxBytes, ChunkHandler onChunk)
+        {
+            IntPtr h = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, false, pid);
+            if (h == IntPtr.Zero) return "access denied (" + Marshal.GetLastWin32Error() + ")";
+            try
+            {
+                byte[] buf = new byte[4 * 1024 * 1024];
+                long total = 0;
+                long addr = 0;
+                int mbiSize = Marshal.SizeOf(typeof(MBI));
+                MBI mbi;
+                while (total < maxBytes)
+                {
+                    if (VirtualQueryEx(h, new IntPtr(addr), out mbi, new IntPtr(mbiSize)) == IntPtr.Zero) break;
+                    long baseAddr = mbi.BaseAddress.ToInt64();
+                    long size = mbi.RegionSize.ToInt64();
+                    if (size <= 0) break;
+                    if (mbi.State == MEM_COMMIT && (mbi.Type & typeMask) != 0 && Readable(mbi.Protect))
+                    {
+                        long off = 0;
+                        while (off < size && total < maxBytes)
+                        {
+                            int want = (int)Math.Min(buf.Length, size - off);
+                            IntPtr got;
+                            if (!ReadProcessMemory(h, new IntPtr(baseAddr + off), buf, new IntPtr(want), out got)) break;
+                            int n = (int)got.ToInt64();
+                            if (n <= 0) break;
+                            onChunk(buf, n);
+                            total += n;
+                            off += n;
+                        }
+                    }
+                    long next = baseAddr + size;
+                    if (next <= addr) break;
+                    addr = next;
+                }
+                return null;
+            }
+            finally { CloseHandle(h); }
+        }
+
+        // ---- path strings -----------------------------------------------------------------------
+        static readonly Regex PathRe = new Regex(
+            @"(?:[A-Za-z]:|\\Device\\HarddiskVolume\d{1,3})\\(?:[^\\/:*?""<>|\x00-\x1f]{1,120}\\){0,24}[^\\/:*?""<>|\x00-\x1f]{1,120}?\.(?:exe|dll|sys|bat|cmd|ps1|lua|luau|ahk|jar|scr|py)(?![A-Za-z0-9])",
+            RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
+        static readonly Regex DpsRe = new Regex(
+            @"!!([^!\\/:*?""<>|\x00-\x1f]{1,120}?\.[A-Za-z0-9]{2,5})!(\d{4}/\d\d/\d\d:\d\d:\d\d:\d\d)!",
+            RegexOptions.CultureInvariant);
+
+        static void Harvest(string s, HashSet<string> found, int max)
+        {
+            if (found.Count >= max) return;
+            if (s.IndexOf('\\') >= 0)
+            {
+                foreach (Match m in PathRe.Matches(s)) { if (found.Count >= max) return; found.Add(m.Value); }
+            }
+            if (s.IndexOf("!!", StringComparison.Ordinal) >= 0)
+            {
+                foreach (Match m in DpsRe.Matches(s)) { if (found.Count >= max) return; found.Add("!!" + m.Groups[1].Value + "|" + m.Groups[2].Value); }
+            }
+        }
+
+        static void ExtractStrings(byte[] b, int len, HashSet<string> found, int max)
+        {
+            const int MIN = 6;
+            const int MAXLEN = 2048;
+            int start = -1;
+            bool interesting = false;
+            for (int i = 0; i <= len; i++)
+            {
+                bool ok = false;
+                byte c = 0;
+                if (i < len) { c = b[i]; ok = c >= 0x20 && c < 0x7F; }
+                if (ok)
+                {
+                    if (start < 0) { start = i; interesting = false; }
+                    if (c == 0x5C || c == 0x21) interesting = true;
+                    if (i - start >= MAXLEN)
+                    {
+                        if (interesting) Harvest(Encoding.ASCII.GetString(b, start, i - start), found, max);
+                        start = -1;
+                    }
+                }
+                else
+                {
+                    if (start >= 0 && interesting && i - start >= MIN) Harvest(Encoding.ASCII.GetString(b, start, i - start), found, max);
+                    start = -1;
+                }
+            }
+            start = -1;
+            interesting = false;
+            for (int i = 0; i <= len; i += 2)
+            {
+                bool ok = false;
+                int ch = 0;
+                if (i + 1 < len) { ch = b[i] | (b[i + 1] << 8); ok = ch >= 0x20 && ch < 0xD800 && ch != 0x7F; }
+                if (ok)
+                {
+                    if (start < 0) { start = i; interesting = false; }
+                    if (ch == 0x5C || ch == 0x21) interesting = true;
+                    if ((i - start) / 2 >= MAXLEN)
+                    {
+                        if (interesting) Harvest(Encoding.Unicode.GetString(b, start, i - start), found, max);
+                        start = -1;
+                    }
+                }
+                else
+                {
+                    if (start >= 0 && interesting && (i - start) / 2 >= MIN) Harvest(Encoding.Unicode.GetString(b, start, i - start), found, max);
+                    start = -1;
+                }
+            }
+        }
+
+        // Executable paths and DPS "!!name!timestamp" records found in a process's private/mapped memory.
+        public static string[] ProcessPaths(int pid, long maxBytes, int maxResults, out string error)
+        {
+            var found = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            error = WalkMemory(pid, MEM_PRIVATE | MEM_MAPPED, maxBytes, delegate(byte[] buf, int len) { ExtractStrings(buf, len, found, maxResults); });
+            string[] arr = new string[found.Count];
+            found.CopyTo(arr);
+            return arr;
+        }
+
+        // Same for a file on disk (copied databases, logs).
+        public static string[] FilePaths(string path, long maxBytes, int maxResults)
+        {
+            var found = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            using (var fs = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete))
+            {
+                byte[] buf = new byte[4 * 1024 * 1024];
+                long total = 0;
+                int n;
+                while (total < maxBytes && (n = fs.Read(buf, 0, buf.Length)) > 0) { ExtractStrings(buf, n, found, maxResults); total += n; }
+            }
+            string[] arr = new string[found.Count];
+            found.CopyTo(arr);
+            return arr;
+        }
+
+        // ---- fingerprints -------------------------------------------------------------------------
+        public static ulong FileNeedles(string path, Matcher m, long maxBytes)
+        {
+            ulong hits = 0;
+            int state = 0;
+            using (var fs = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete))
+            {
+                byte[] buf = new byte[1024 * 1024];
+                long total = 0;
+                int n;
+                while (total < maxBytes && (n = fs.Read(buf, 0, buf.Length)) > 0) { hits |= m.Scan(buf, n, ref state); total += n; }
+            }
+            return hits;
+        }
+
+        public static ulong ProcessNeedles(int pid, Matcher m, long maxBytes, out string error)
+        {
+            ulong hits = 0;
+            error = WalkMemory(pid, MEM_PRIVATE | MEM_MAPPED | MEM_IMAGE, maxBytes, delegate(byte[] buf, int len) { int st = 0; hits |= m.Scan(buf, len, ref st); });
+            return hits;
+        }
+
+        public static bool HasEmbeddedSignature(string path)
+        {
+            try
+            {
+                using (var fs = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete))
+                using (var br = new BinaryReader(fs))
+                {
+                    if (fs.Length < 0x40 || br.ReadUInt16() != 0x5A4D) return false;
+                    fs.Position = 0x3C;
+                    int pe = br.ReadInt32();
+                    if (pe <= 0 || pe > fs.Length - 160) return false;
+                    fs.Position = pe;
+                    if (br.ReadUInt32() != 0x00004550) return false;
+                    fs.Position = pe + 24;
+                    ushort magic = br.ReadUInt16();
+                    long dir = pe + 24 + (magic == 0x20B ? 144 : 128);
+                    if (dir + 8 > fs.Length) return false;
+                    fs.Position = dir;
+                    br.ReadUInt32();
+                    return br.ReadUInt32() > 0;
+                }
+            }
+            catch { return false; }
+        }
+
+        public static string[] PeSections(string path)
+        {
+            var list = new List<string>();
+            try
+            {
+                using (var fs = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete))
+                using (var br = new BinaryReader(fs))
+                {
+                    if (fs.Length < 0x40 || br.ReadUInt16() != 0x5A4D) return list.ToArray();
+                    fs.Position = 0x3C;
+                    int pe = br.ReadInt32();
+                    if (pe <= 0 || pe > fs.Length - 24) return list.ToArray();
+                    fs.Position = pe;
+                    if (br.ReadUInt32() != 0x00004550) return list.ToArray();
+                    fs.Position = pe + 6;
+                    int count = br.ReadUInt16();
+                    fs.Position = pe + 20;
+                    int optSize = br.ReadUInt16();
+                    long sec = pe + 24 + optSize;
+                    for (int i = 0; i < count && i < 96; i++)
+                    {
+                        long pos = sec + i * 40;
+                        if (pos + 8 > fs.Length) break;
+                        fs.Position = pos;
+                        list.Add(Encoding.ASCII.GetString(br.ReadBytes(8)).TrimEnd('\0'));
+                    }
+                }
+            }
+            catch { }
+            return list.ToArray();
+        }
+
+        // ---- registry app hive (Amcache copy) --------------------------------------------------------
+        public static int LastHiveError;
+        public static RegistryKey LoadAppHive(string file)
+        {
+            IntPtr h;
+            LastHiveError = RegLoadAppKey(file, out h, 0x20019, 0, 0);
+            if (LastHiveError != 0) return null;
+            return RegistryKey.FromHandle(new SafeRegistryHandle(h, true));
+        }
+
+        // ---- USN change journal ------------------------------------------------------------------------
+        class DirInfo { public string Name; public ulong Parent; }
+
+        static string PathById(SafeFileHandle vol, ulong frn)
+        {
+            var id = new FILE_ID_DESCRIPTOR();
+            id.dwSize = 24; id.Type = 0; id.FileId = (long)frn;
+            using (SafeFileHandle h = OpenFileById(vol, ref id, 0x80, 7, IntPtr.Zero, 0x02000000))
+            {
+                if (h.IsInvalid) return null;
+                var sb = new StringBuilder(1024);
+                uint n = GetFinalPathNameByHandle(h, sb, 1024, 0);
+                if (n == 0 || n >= 1024) return null;
+                string path = sb.ToString();
+                if (path.StartsWith(@"\\?\UNC\")) return null;
+                if (path.StartsWith(@"\\?\")) path = path.Substring(4);
+                return path.TrimEnd('\\');
+            }
+        }
+
+        static string ResolveDir(SafeFileHandle vol, ulong frn, Dictionary<ulong, DirInfo> dirs, Dictionary<ulong, string> cache, string root, int depth)
+        {
+            string cached;
+            if (cache.TryGetValue(frn, out cached)) return cached;
+            string path = PathById(vol, frn);
+            if (path == null)
+            {
+                DirInfo d;
+                if (depth < 64 && dirs.TryGetValue(frn, out d) && d.Parent != frn)
+                    path = ResolveDir(vol, d.Parent, dirs, cache, root, depth + 1) + "\\" + d.Name;
+                else
+                    path = root + "\\<deleted folder>";
+            }
+            cache[frn] = path;
+            return path;
+        }
+
+        // Reads the newest maxBytes of the volume's change journal. Keeps records for files with one of the
+        // given extensions, folders with one of the given names, and the new name of any such file renamed.
+        public static List<UsnEntry> ReadUsn(string drive, long maxBytes, string[] exts, string[] dirNames, DateTime since, string skipPrefix, UsnInfo info)
+        {
+            var result = new List<UsnEntry>();
+            info.Ok = false;
+            string letter = drive.TrimEnd(':', '\\');
+            using (SafeFileHandle h = CreateFile(@"\\.\" + letter + ":", 0x80000000, 3, IntPtr.Zero, 3, 0, IntPtr.Zero))
+            {
+                if (h.IsInvalid) { info.Error = "cannot open volume (" + Marshal.GetLastWin32Error() + ")"; return result; }
+                byte[] q = new byte[80];
+                int ret;
+                if (!DeviceIoControl(h, 0x000900F4, null, 0, q, q.Length, out ret, IntPtr.Zero)) { info.Error = "no change journal (" + Marshal.GetLastWin32Error() + ")"; return result; }
+                info.JournalId = BitConverter.ToUInt64(q, 0);
+                info.FirstUsn = BitConverter.ToInt64(q, 8);
+                info.NextUsn = BitConverter.ToInt64(q, 16);
+                info.MaximumSize = BitConverter.ToUInt64(q, 40);
+
+                var dirs = new Dictionary<ulong, DirInfo>();
+                byte[] buf = new byte[1024 * 1024];
+                var extSet = new HashSet<string>(exts, StringComparer.OrdinalIgnoreCase);
+                var dirSet = new HashSet<string>(dirNames, StringComparer.OrdinalIgnoreCase);
+                var renamed = new HashSet<ulong>();
+                long stop = info.NextUsn;
+                long usn = Math.Max(info.FirstUsn, stop - maxBytes);
+                byte[] rin = new byte[40];
+                Array.Copy(BitConverter.GetBytes(0xFFFFFFFFu), 0, rin, 8, 4);
+                Array.Copy(BitConverter.GetBytes(info.JournalId), 0, rin, 32, 8);
+                bool first = true;
+                while (usn < stop)
+                {
+                    Array.Copy(BitConverter.GetBytes(usn), 0, rin, 0, 8);
+                    if (!DeviceIoControl(h, 0x000900BB, rin, rin.Length, buf, buf.Length, out ret, IntPtr.Zero))
+                    {
+                        if (info.RecordsRead == 0) info.Error = "cannot read journal (" + Marshal.GetLastWin32Error() + ")";
+                        break;
+                    }
+                    if (ret <= 8) break;
+                    long next = BitConverter.ToInt64(buf, 0);
+                    int p = 8;
+                    while (p + 60 <= ret)
+                    {
+                        int len = BitConverter.ToInt32(buf, p);
+                        if (len <= 0) break;
+                        if (BitConverter.ToUInt16(buf, p + 4) == 2)
+                        {
+                            info.RecordsRead++;
+                            long ts = BitConverter.ToInt64(buf, p + 32);
+                            if (first) { try { info.OldestRecord = DateTime.FromFileTime(ts); } catch { } first = false; }
+                            ulong frn = BitConverter.ToUInt64(buf, p + 8);
+                            ulong parent = BitConverter.ToUInt64(buf, p + 16);
+                            uint reason = BitConverter.ToUInt32(buf, p + 40);
+                            bool isDir = (BitConverter.ToUInt32(buf, p + 52) & 0x10) != 0;
+                            string name = Encoding.Unicode.GetString(buf, p + BitConverter.ToUInt16(buf, p + 58), BitConverter.ToUInt16(buf, p + 56));
+                            if (isDir && !dirs.ContainsKey(frn)) { var d = new DirInfo(); d.Name = name; d.Parent = parent; dirs[frn] = d; }
+                            string ext = "";
+                            int dot = name.LastIndexOf('.');
+                            if (dot >= 0) ext = name.Substring(dot);
+                            bool keep = isDir ? dirSet.Contains(name) : extSet.Contains(ext);
+                            if (keep && (reason & 0x1000) != 0) renamed.Add(frn);
+                            if (!keep && (reason & 0x2000) != 0 && renamed.Contains(frn)) keep = true;
+                            if (keep && result.Count < 400000)
+                            {
+                                var e = new UsnEntry();
+                                try { e.Time = DateTime.FromFileTime(ts); } catch { }
+                                e.Reason = reason; e.Name = name; e.Frn = frn; e.ParentFrn = parent; e.IsDir = isDir;
+                                result.Add(e);
+                            }
+                        }
+                        p += len;
+                    }
+                    if (next <= usn) break;
+                    usn = next;
+                }
+                string root = letter + ":";
+                var cache = new Dictionary<ulong, string>();
+                var kept = new List<UsnEntry>();
+                foreach (var e in result)
+                {
+                    if (e.Time < since) continue;
+                    e.Path = ResolveDir(h, e.ParentFrn, dirs, cache, root, 0) + "\\" + e.Name;
+                    if (!string.IsNullOrEmpty(skipPrefix) && e.Path.StartsWith(skipPrefix, StringComparison.OrdinalIgnoreCase) && !e.Name.EndsWith(".pf", StringComparison.OrdinalIgnoreCase)) continue;
+                    kept.Add(e);
+                }
+                result = kept;
+                info.Ok = info.RecordsRead > 0 || info.Error == null;
+            }
+            return result;
+        }
+    }
+}
+'@
+
+$script:BsmmForensicsError = ''
+function Initialize-BsmmForensics {
+    if ('BSMM.Forensics' -as [type]) { return $true }
+    try {
+        Add-Type -TypeDefinition $script:BsmmForensicsSource -ErrorAction Stop
+        return $true
+    } catch {
+        $script:BsmmForensicsError = $_.Exception.Message
+        return $false
+    }
+}
+
+# One fast regex built from the cheat-name list (used to pre-filter thousands of paths).
+$script:KeywordRegex = $null
+function Get-BsmmKeywordRegex {
+    if ($script:KeywordRegex) { return $script:KeywordRegex }
+    $sub = @(); $tok = @()
+    foreach ($kw in $script:CheatKeywords) {
+        if ($kw.Length -le 4 -or $script:TokenOnlyKeywords -contains $kw) { $tok += [regex]::Escape($kw) } else { $sub += [regex]::Escape($kw) }
+    }
+    $parts = @()
+    if ($sub.Count -gt 0) { $parts += '(?:' + ($sub -join '|') + ')' }
+    if ($tok.Count -gt 0) { $parts += '(?:^|[\\_\s\-\.])(?:' + ($tok -join '|') + ')(?:$|[\\_\s\-\.])' }
+    $script:KeywordRegex = New-Object System.Text.RegularExpressions.Regex (('(?i)' + ($parts -join '|')), [System.Text.RegularExpressions.RegexOptions]::Compiled)
+    return $script:KeywordRegex
+}
+
+$script:KeywordIgnorePaths = '(?i)\\(BattlEye|EasyAntiCheat[^\\]*|Riot Vanguard|Microsoft Office|WindowsApps|Microsoft Visual Studio|Blitz\\blitz-deps|Overwolf|steamapps\\common|DriverStore|WinSxS)\\'
+function Get-BsmmCheatKeywordFast {
+    param([string]$Text)
+    if (-not $Text) { return $null }
+    if ($Text -match $script:KeywordIgnorePaths) { return $null }
+    if ($Text -match '(?i)(^|\\)(SpectreClient[^\\]*|voiceclarity[^\\]*)$') { return $null }   # Steam game / Windows audio files
+    if (-not (Get-BsmmKeywordRegex).IsMatch($Text)) { return $null }
+    return (Get-MatchedCheatKeyword -Text $Text)
+}
+
+# \Device\HarddiskVolumeN\... -> X:\...  (returns $null for paths on unknown devices)
+function ConvertTo-BsmmDrivePath {
+    param([string]$Path, [hashtable]$Volumes)
+    if ($Path -match '^(\\Device\\HarddiskVolume\d+)(\\.*)$') {
+        if ($Volumes.ContainsKey($matches[1])) { return $Volumes[$matches[1]] + $matches[2] }
+        return $null
+    }
+    return $Path
+}
+
+function Get-BsmmUserFolderRegex {
+    if ($script:UserFolderRegex) { return $script:UserFolderRegex }
+    $roots = @(Get-BsmmUserFolders Desktop) + @(Get-BsmmUserFolders Downloads) + @(Get-BsmmUserFolders Documents)
+    $script:UserFolderRegex = '(?i)^(?:' + (($roots | ForEach-Object { [regex]::Escape($_) }) -join '|') + ')\\'
+    return $script:UserFolderRegex
+}
+
+# Needles searched inside programs and running processes (max 64). Index ranges are used by the verdict below.
+$script:FpNeedles = @(
+    # 0-16: executor Lua API (UNC)
+    'getgenv', 'getrenv', 'getsenv', 'hookfunction', 'hookmetamethod', 'getrawmetatable', 'getnamecallmethod', 'setreadonly',
+    'newcclosure', 'checkcaller', 'getconnections', 'fireclickdetector', 'firetouchinterest', 'identifyexecutor',
+    'queue_on_teleport', 'getscriptbytecode', 'rconsoleprint',
+    # 17-18: Roblox engine internals only externals reference
+    'VisualEngine', 'FakeDataModel',
+    # 19: Roblox process name
+    'RobloxPlayerBeta',
+    # 20-23: reading/writing another process's memory
+    'ReadProcessMemory', 'NtReadVirtualMemory', 'ZwReadVirtualMemory', 'WriteProcessMemory',
+    # 24-25: KeyAuth licence servers (used by cheat loaders)
+    'keyauth.win', 'keyauth.cc'
+)
+
+function Get-BsmmBitCount {
+    param([UInt64]$Value, [int]$From, [int]$To)
+    $n = 0
+    for ($i = $From; $i -le $To; $i++) { if ((($Value -shr $i) -band 1) -eq 1) { $n++ } }
+    return $n
+}
+
+# Turns needle hits into reasons. Empty = nothing suspicious.
+function Get-BsmmFingerprintVerdict {
+    param([UInt64]$Hits)
+    $why = New-Object System.Collections.Generic.List[string]
+    if ($Hits -eq 0) { return $why.ToArray() }
+    $unc = Get-BsmmBitCount $Hits 0 16
+    $rbx = Get-BsmmBitCount $Hits 17 18
+    $rpb = Get-BsmmBitCount $Hits 19 19
+    $ka  = Get-BsmmBitCount $Hits 24 25
+    if ($unc -ge 4) { $why.Add("Roblox executor code ($unc executor-only Lua functions)") }
+    if ($rbx -ge 1 -and $rpb -ge 1) { $why.Add('code that targets Roblox engine internals (external cheat)') }
+    if ($ka -ge 1) { $why.Add('KeyAuth licence server (used by cheat loaders)') }
+    return $why.ToArray()
+}
+
+$script:PackerSectionPattern = '^(?i)(\.vmp\d|\.themida|\.winlice|\.enigma\d|UPX\d|\.mpress\d)$'
+$script:ExecutionEvidence = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+
+# Adds keyword hits to $Alerts, folding 3+ hits under the same cheat folder into one line.
+function Add-BsmmGroupedHits {
+    param($Alerts, [string]$Level, [string]$Label, $Hits)
+    $byRoot = [ordered]@{}
+    foreach ($h in $Hits) {
+        $root = $h.Path
+        $cut = $h.Path.LastIndexOf('\')
+        if ($cut -gt 0) { $root = $h.Path.Substring(0, $cut) }
+        $parts = $h.Path -split '\\'
+        for ($i = 1; $i -lt $parts.Count - 1; $i++) {
+            if (Get-MatchedCheatKeyword -Text $parts[$i] -FolderName) { $root = ($parts[0..$i] -join '\'); break }
+        }
+        $key = "$($h.Kw)|$root"
+        if (-not $byRoot.Contains($key)) { $byRoot[$key] = New-Object System.Collections.Generic.List[object] }
+        $byRoot[$key].Add($h)
+    }
+    # a cheat seen in more than 3 different places becomes a single line with two examples
+    $byKw = @{}
+    foreach ($key in $byRoot.Keys) { $kw = $key.Substring(0, $key.IndexOf('|')); if (-not $byKw.ContainsKey($kw)) { $byKw[$kw] = 0 }; $byKw[$kw]++ }
+    $folded = @{}
+    foreach ($key in $byRoot.Keys) {
+        $kw = $key.Substring(0, $key.IndexOf('|'))
+        if ($byKw[$kw] -gt 3) {
+            if ($folded.ContainsKey($kw)) { continue }
+            $folded[$kw] = $true
+            $all = @(); foreach ($k2 in $byRoot.Keys) { if ($k2.StartsWith("$kw|")) { $all += $byRoot[$k2] } }
+            $ex = ($all | Select-Object -First 2 | ForEach-Object { $_.Path + $_.Extra }) -join ' ; '
+            $Alerts.Add("${Level}: $Label [$kw] $($all.Count) entries in $($byKw[$kw]) places (e.g. $ex)")
+            continue
+        }
+        $g = $byRoot[$key]
+        if ($g.Count -le 2) {
+            foreach ($h in $g) { $Alerts.Add("${Level}: $Label [$($h.Kw)]$($h.Extra) -> $($h.Path)") }
+        } else {
+            $root = $key.Substring($key.IndexOf('|') + 1)
+            $leaf = $g[0].Path.Substring($g[0].Path.LastIndexOf('\') + 1)
+            $Alerts.Add("${Level}: $Label [$($g[0].Kw)] $($g.Count) programs under $root (e.g. $leaf$($g[0].Extra))")
+        }
+    }
+}
+# =============================================================================
+#   Tier 1: name-independent evidence
+# =============================================================================
+
+# --- Service memory traces --------------------------------------------------------------------------
+# DPS, PcaSvc, Task Scheduler and Explorer keep the paths of programs run since boot in memory, including
+# programs that were renamed or deleted afterwards. A reboot clears them, a cleaner usually cannot.
+function Get-ServiceMemoryTraceAlerts {
+    if (-not (Test-Admin)) { return @('WARNING: Service memory traces need administrator rights') }
+    if (-not (Initialize-BsmmForensics)) { return @("WARNING: Forensic engine unavailable ($script:BsmmForensicsError)") }
+    try { [System.Diagnostics.Process]::EnterDebugMode() } catch {}
+
+    $targets = [ordered]@{}
+    foreach ($svc in @('DPS', 'PcaSvc', 'Schedule')) {
+        try {
+            $s = Get-CimInstance Win32_Service -Filter "Name='$svc'" -ErrorAction Stop
+            if ($s -and $s.ProcessId -gt 0) { $targets[$svc] = [int]$s.ProcessId }
+        } catch {}
+    }
+    $exp = Get-Process -Name explorer -ErrorAction SilentlyContinue | Sort-Object StartTime | Select-Object -First 1
+    if ($exp) { $targets['Explorer'] = [int]$exp.Id }
+
+    $alerts = New-Object System.Collections.Generic.List[string]
+    $volumes = Get-BsmmVolumeMap
+    $userRe = Get-BsmmUserFolderRegex
+    $total = 0
+    $reported = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+    $kwHits = [ordered]@{}
+    foreach ($src in $targets.Keys) {
+        $kwHits[$src] = New-Object System.Collections.Generic.List[object]
+        $err = $null
+        $found = @()
+        try { $found = [BSMM.Forensics]::ProcessPaths($targets[$src], 512MB, 25000, [ref]$err) } catch { $err = $_.Exception.Message }
+        if ($err) { $alerts.Add("WARNING: Could not read $src memory ($err)"); continue }
+        $total += $found.Count
+        foreach ($raw in $found) {
+            if ($raw.StartsWith('!!')) {
+                $parts = $raw.Substring(2) -split '\|', 2
+                $kw = Get-BsmmCheatKeywordFast $parts[0]
+                if ($kw -and $reported.Add("dps|$($parts[0])")) { $alerts.Add("FAILURE: [$src] ran '$($parts[0])' [$kw] (file stamp $($parts[1]))") }
+                continue
+            }
+            $p = ConvertTo-BsmmDrivePath -Path $raw -Volumes $volumes
+            if (-not $p) { continue }
+            $kw = Get-BsmmCheatKeywordFast $p
+            if ($kw) {
+                if ($reported.Add($p)) { $kwHits[$src].Add([pscustomobject]@{ Kw = $kw; Path = $p; Extra = '' }) }
+                continue
+            }
+            if ($p -match '^(?i)[a-z]:\\(windows|program files|program files \(x86\)|programdata\\microsoft)\\') { continue }
+            $isExe = $p -match '(?i)\.(exe|bat|cmd|ps1|lua|luau|ahk|jar|py|scr)$'
+            if (-not $isExe -and $p -notmatch '(?i)\.dll$') { continue }
+            $exists = $false
+            try { $exists = [System.IO.File]::Exists($p) } catch {}
+            if ($exists) {
+                [void]$script:ExecutionEvidence.Add($p)
+            } elseif ($isExe -and $src -ne 'Explorer' -and $p -match $userRe -and $reported.Add($p)) {
+                $alerts.Add("WARNING: [$src] ran since boot, and the file is now gone (deleted or renamed) -> $p")
+            }
+        }
+    }
+    foreach ($src in $kwHits.Keys) {
+        if ($kwHits[$src].Count -eq 0) { continue }
+        $verb = 'ran since boot'; if ($src -eq 'Explorer') { $verb = 'opened or showed since boot' }
+        Add-BsmmGroupedHits -Alerts $alerts -Level 'FAILURE' -Label "[$src] $verb" -Hits $kwHits[$src]
+    }
+    $alerts.Add("INFO: Read $total execution traces from $(@($targets.Keys) -join ', ')")
+    if (-not ($alerts | Where-Object { $_ -like 'FAILURE*' -or $_ -like 'WARNING*' })) {
+        $alerts.Insert(0, 'SUCCESS: No cheat or deleted program in the service memory traces')
+    }
+    return @($alerts | Select-Object -First 40)
+}
+
+# --- Change journal evidence --------------------------------------------------------------------------
+# The NTFS change journal records every create / delete / rename. A user-mode cleaner can only delete the
+# whole journal, which is itself caught (USN Journal and Logging Tamper checks).
+function Get-ChangeJournalAlerts {
+    if (-not (Test-Admin)) { return @('WARNING: The change journal needs administrator rights') }
+    if (-not (Initialize-BsmmForensics)) { return @("WARNING: Forensic engine unavailable ($script:BsmmForensicsError)") }
+
+    $info = New-Object BSMM.UsnInfo
+    $exts = @('.exe', '.dll', '.sys', '.lua', '.luau', '.pf', '.onnx', '.engine', '.pt', '.ahk', '.bat', '.ps1', '.asi')
+    $entries = $null
+    try { $entries = [BSMM.Forensics]::ReadUsn($env:SystemDrive, 256MB, [string[]]$exts, [string[]]@('autoexec'), (Get-Date).AddDays(-7), ($env:SystemRoot + '\'), $info) } catch {
+        return @("WARNING: Could not read the change journal ($($_.Exception.Message))")
+    }
+    if (-not $info.Ok) { return @("WARNING: Could not read the change journal ($($info.Error))") }
+
+    $alerts = New-Object System.Collections.Generic.List[string]
+    $logon = Get-LogonTime
+    $weekAgo = (Get-Date).AddDays(-7)
+    $userRe = Get-BsmmUserFolderRegex
+    $kwSeen = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+    $pfDeletes = New-Object System.Collections.Generic.List[datetime]
+    $deleted = New-Object System.Collections.Generic.List[string]
+    $replaced = New-Object System.Collections.Generic.List[string]
+    $renames = New-Object System.Collections.Generic.List[string]
+    $models = New-Object System.Collections.Generic.List[string]
+    $sysCreated = @{}
+    $oldNames = @{}
+
+    $jHits = New-Object System.Collections.Generic.List[object]
+    foreach ($e in $entries) {
+        $r = $e.Reason
+        $isDelete = ($r -band 0x200) -ne 0
+        $isCreate = ($r -band 0x100) -ne 0
+        $when = Get-Date $e.Time -Format 'MM-dd HH:mm'
+
+        if (($r -band 0x1000) -ne 0) { $oldNames[[string]$e.Frn] = $e.Path }
+        if (($r -band 0x2000) -ne 0 -and $oldNames.ContainsKey([string]$e.Frn)) {
+            $old = $oldNames[[string]$e.Frn]
+            $oldExt = ''; $newExt = ''; try { $oldExt = [IO.Path]::GetExtension($old); $newExt = [IO.Path]::GetExtension($e.Path) } catch {}
+            if ($e.Time -ge $logon -and $oldExt -ne $newExt -and $oldExt -match '(?i)^\.(exe|dll|lua|luau|ahk|sys)$' -and $old -match $userRe) {
+                $renames.Add("$when  $old  ->  $([IO.Path]::GetFileName($e.Path))")
+            }
+            $oldNames.Remove([string]$e.Frn)
+        }
+
+        $kw = Get-BsmmCheatKeywordFast $e.Path
+        if ($kw) {
+            $action = 'changed'
+            if ($isDelete) { $action = 'deleted' } elseif (($r -band 0x3000) -ne 0) { $action = 'renamed' } elseif ($isCreate) { $action = 'created' }
+            if ($kwSeen.Add("$action|$($e.Path)")) { $jHits.Add([pscustomobject]@{ Kw = $kw; Path = $e.Path; Extra = " $action $when" }) }
+            continue
+        }
+        if ($e.IsDir) {
+            if ($isCreate -and $kwSeen.Add("dir|$($e.Path)")) { $alerts.Add("FAILURE: Journal: executor 'autoexec' folder created $when -> $($e.Path)") }
+            continue
+        }
+        $ext = ''; $dot = $e.Name.LastIndexOf('.'); if ($dot -ge 0) { $ext = $e.Name.Substring($dot).ToLower() }
+        if ($ext -eq '.pf') { if ($isDelete -and $e.Time -ge $logon) { $pfDeletes.Add($e.Time) }; continue }
+        if ($ext -eq '.sys' -and $e.Path -match '(?i)\\(Temp|AppData)\\') {
+            $k = [string]$e.Frn
+            if ($isCreate) { $sysCreated[$k] = $e.Time }
+            if ($isDelete -and $sysCreated.ContainsKey($k) -and ($e.Time - $sysCreated[$k]).TotalSeconds -le 120) {
+                $leaf = $e.Name.ToLower()
+                $lvl = 'WARNING'
+                if ($script:VulnerableDriverTiers.ContainsKey($leaf) -and $script:VulnerableDriverTiers[$leaf] -eq 'FAILURE') { $lvl = 'FAILURE' }
+                $alerts.Add("${lvl}: Journal: driver file dropped in a temp folder and deleted within 2 minutes $when (how kernel cheats are loaded) -> $($e.Path)")
+            }
+            continue
+        }
+        if ($ext -in @('.onnx', '.engine', '.pt') -and $isCreate -and $e.Path -match $userRe) { $models.Add("$when  $($e.Path)"); continue }
+        if ($e.Time -lt $logon -or $e.Path -notmatch $userRe) { continue }
+        if ($isDelete) { $deleted.Add("$when  $($e.Path)") }
+        elseif (($r -band 0x5) -ne 0 -and -not $isCreate -and $ext -eq '.exe') { $replaced.Add("$when  $($e.Path)") }
+    }
+
+    Add-BsmmGroupedHits -Alerts $alerts -Level 'FAILURE' -Label 'Journal: changed' -Hits $jHits
+
+    # Prefetch wipe: many .pf deleted within two minutes
+    $pf = @($pfDeletes | Sort-Object)
+    $burst = 0; $burstAt = $null
+    for ($i = 0; $i -lt $pf.Count; $i++) {
+        $j = $i
+        while ($j + 1 -lt $pf.Count -and ($pf[$j + 1] - $pf[$i]).TotalSeconds -le 120) { $j++ }
+        if (($j - $i + 1) -gt $burst) { $burst = $j - $i + 1; $burstAt = $pf[$i] }
+    }
+    if ($burst -ge 20) { $alerts.Add("FAILURE: Journal: $burst Prefetch files deleted within 2 minutes at $(Get-Date $burstAt -Format 'HH:mm') (Prefetch wipe)") }
+    elseif ($burst -ge 6) { $alerts.Add("WARNING: Journal: $burst Prefetch files deleted within 2 minutes at $(Get-Date $burstAt -Format 'HH:mm')") }
+
+    foreach ($x in @($renames | Select-Object -Unique -First 10)) { $alerts.Add("WARNING: Journal: program renamed to a non-program file since logon: $x") }
+    foreach ($x in @($replaced | Select-Object -Unique -First 10)) { $alerts.Add("WARNING: Journal: program file overwritten in place since logon: $x") }
+    foreach ($x in @($deleted | Select-Object -Unique -First 15)) { $alerts.Add("WARNING: Journal: deleted since logon: $x") }
+    foreach ($x in @($models | Select-Object -Unique -First 5)) { $alerts.Add("WARNING: Journal: AI model file created (aimbots use these): $x") }
+
+    $covers = 'unknown'
+    if ($info.OldestRecord -gt [datetime]'2000-01-01') { $covers = Get-Date $info.OldestRecord -Format 'yyyy-MM-dd HH:mm' }
+    $alerts.Add("INFO: Change journal read back to $covers ($($info.RecordsRead) records)")
+    if (-not ($alerts | Where-Object { $_ -like 'FAILURE*' -or $_ -like 'WARNING*' })) {
+        $alerts.Insert(0, 'SUCCESS: No suspicious deletes, renames or replaced programs in the change journal')
+    }
+    return @($alerts | Select-Object -First 45)
+}
+
+# --- Code fingerprints --------------------------------------------------------------------------------
+# Looks INSIDE programs and running processes for executor Lua API, Roblox engine internals and loader
+# licence checks, so renamed cheats are still recognised. Also the executor folder layout and packers.
+$script:FpSkipAppData = '^(?i)(Microsoft|Packages|Temp|Google|Mozilla|NVIDIA.*|Roblox|Bloxstrap|Fishstrap|Comms|ConnectedDevicesPlatform|D3DSCache|CrashDumps|pip|npm-cache|Yarn|JetBrains|Adobe|Discord.*|Spotify|Steam|Epic Games|EpicGamesLauncher|Riot Games|Battle\.net|Opera Software|BraveSoftware|CapCut|Medal|Overwolf|Zoom|Docker|GitHubDesktop|Postman|Notion|slack|Code|Cursor|Claude|AnthropicClaude)$'
+
+function Get-CodeFingerprintAlerts {
+    if (-not (Initialize-BsmmForensics)) { return @("WARNING: Forensic engine unavailable ($script:BsmmForensicsError)") }
+    try { [System.Diagnostics.Process]::EnterDebugMode() } catch {}
+    $matcher = [BSMM.Matcher]::new([string[]]$script:FpNeedles)
+    $alerts = New-Object System.Collections.Generic.List[string]
+    $files = New-Object 'System.Collections.Generic.Dictionary[string,System.IO.FileInfo]' ([StringComparer]::OrdinalIgnoreCase)
+    $add = {
+        param($fi)
+        if ($fi -and $fi.Length -ge 16KB -and $fi.Length -le 80MB -and -not $files.ContainsKey($fi.FullName)) { $files[$fi.FullName] = $fi }
+    }
+
+    $userDirs = @(Get-BsmmUserFolders Desktop) + @(Get-BsmmUserFolders Downloads) + @(Get-BsmmUserFolders Documents)
+    foreach ($d in $userDirs) {
+        Get-ChildItem -LiteralPath $d -File -Recurse -Depth 4 -Force -ErrorAction SilentlyContinue |
+            Where-Object { $_.Extension -match '^(?i)\.(exe|dll)$' } | ForEach-Object { & $add $_ }
+    }
+    # Outside the player's own folders, skip programs that carry a signature (cheats are almost never signed).
+    $addUnsigned = {
+        param($fi)
+        if ($fi -and -not [BSMM.Forensics]::HasEmbeddedSignature($fi.FullName)) { & $add $fi }
+    }
+    foreach ($d in @($env:LOCALAPPDATA, $env:APPDATA)) {
+        Get-ChildItem -LiteralPath $d -Directory -Force -ErrorAction SilentlyContinue | Where-Object { $_.Name -notmatch $script:FpSkipAppData } | ForEach-Object {
+            Get-ChildItem -LiteralPath $_.FullName -File -Recurse -Depth 2 -Force -Filter '*.exe' -ErrorAction SilentlyContinue | ForEach-Object { & $addUnsigned $_ }
+        }
+    }
+    Get-ChildItem -LiteralPath $env:TEMP -File -Recurse -Depth 1 -Force -Filter '*.exe' -ErrorAction SilentlyContinue | ForEach-Object { & $addUnsigned $_ }
+    foreach ($p in @($script:ExecutionEvidence)) {
+        if ($p -match '(?i)\.(exe|dll)$') { try { & $addUnsigned (Get-Item -LiteralPath $p -Force -ErrorAction Stop) } catch {} }
+    }
+
+    # 1. files on disk (newest first, time and size capped)
+    $sw = [Diagnostics.Stopwatch]::StartNew()
+    $budget = 3GB; $used = 0; $scanned = 0; $limited = $false
+    foreach ($fi in @($files.Values | Sort-Object -Property LastWriteTime -Descending)) {
+        if ($used -ge $budget -or $sw.Elapsed.TotalSeconds -gt 35) { $limited = $true; break }
+        if ($fi.FullName -match '(?i)\\(Roblox|Bloxstrap|Fishstrap)\\Versions\\|^[a-z]:\\windows\\') { continue }
+        $hits = [UInt64]0
+        try { $hits = [BSMM.Forensics]::FileNeedles($fi.FullName, $matcher, 80MB) } catch { continue }
+        $used += $fi.Length; $scanned++
+        $why = @(Get-BsmmFingerprintVerdict $hits)
+        if ($why.Count -gt 0) {
+            $sig = Get-CachedSignatureStatus -Path $fi.FullName
+            if ($sig -eq 'Valid') { $alerts.Add("WARNING: Signed program contains $($why -join '; ') -> $($fi.FullName)") }
+            else { $alerts.Add("FAILURE: Program contains $($why -join '; ') ($sig) -> $($fi.FullName)") }
+            continue
+        }
+        $packers = @([BSMM.Forensics]::PeSections($fi.FullName) | Where-Object { $_ -match $script:PackerSectionPattern })
+        if ($packers.Count -gt 0 -and (Get-CachedSignatureStatus -Path $fi.FullName) -ne 'Valid') {
+            $alerts.Add("WARNING: Unsigned, protected program (packed with $(($packers | Select-Object -Unique) -join '/')) - cheats hide their code this way -> $($fi.FullName)")
+        }
+    }
+
+    # 2. running processes (unsigned, not Windows, never Roblox: reading Roblox's memory can crash it)
+    $procScanned = 0
+    foreach ($p in @(Get-Process -ErrorAction SilentlyContinue)) {
+        if ($sw.Elapsed.TotalSeconds -gt 60) { $limited = $true; break }
+        if ($p.Id -eq $PID -or $p.ProcessName -match '^(?i)Roblox') { continue }
+        $path = $null
+        try { $path = $p.Path } catch {}
+        if (-not $path -or $path -match '^(?i)[a-z]:\\windows\\') { continue }
+        if ((Get-CachedSignatureStatus -Path $path) -eq 'Valid') { continue }
+        $err = $null
+        $hits = [UInt64]0
+        try { $hits = [BSMM.Forensics]::ProcessNeedles($p.Id, $matcher, 256MB, [ref]$err) } catch { continue }
+        $procScanned++
+        $why = @(Get-BsmmFingerprintVerdict $hits)
+        if ($why.Count -gt 0) { $alerts.Add("FAILURE: Running program contains $($why -join '; ') -> $($p.ProcessName) (PID $($p.Id)) $path") }
+    }
+
+    # 3. executor folder layout and executor scripts
+    $layoutRoots = $userDirs + @($env:LOCALAPPDATA, $env:APPDATA)
+    foreach ($r in $layoutRoots) {
+        Get-ChildItem -LiteralPath $r -Directory -Recurse -Depth 3 -Force -Filter 'autoexec' -ErrorAction SilentlyContinue | ForEach-Object {
+            $parent = $_.Parent.FullName
+            if ((Test-Path -LiteralPath (Join-Path $parent 'workspace')) -or (Test-Path -LiteralPath (Join-Path $parent 'scripts'))) {
+                $alerts.Add("FAILURE: Roblox executor folder layout (autoexec + workspace/scripts) -> $parent")
+            } else {
+                $alerts.Add("WARNING: Folder named 'autoexec' (Roblox executors use this) -> $($_.FullName)")
+            }
+        }
+    }
+    $luaHits = 0
+    foreach ($d in $userDirs) {
+        foreach ($f in @(Get-ChildItem -LiteralPath $d -File -Recurse -Depth 4 -Force -ErrorAction SilentlyContinue | Where-Object { $_.Extension -match '^(?i)\.(lua|luau)$' -and $_.Length -le 4MB } | Select-Object -First 300)) {
+            if ($luaHits -ge 8) { break }
+            $h = [UInt64]0
+            try { $h = [BSMM.Forensics]::FileNeedles($f.FullName, $matcher, 4MB) } catch { continue }
+            if ((Get-BsmmBitCount $h 0 16) -ge 2) { $luaHits++; $alerts.Add("WARNING: Exploit script (uses executor-only Lua functions) -> $($f.FullName)") }
+        }
+    }
+
+    $note = "INFO: Looked inside $scanned programs and $procScanned running processes"
+    if ($limited) { $note += ' (stopped at the time limit; newest files first)' }
+    $alerts.Add($note)
+    if (-not ($alerts | Where-Object { $_ -like 'FAILURE*' -or $_ -like 'WARNING*' })) {
+        $alerts.Insert(0, 'SUCCESS: No executor, external or loader code found inside programs or running processes')
+    }
+    return @($alerts | Select-Object -Unique -First 45)
+}
+
+# --- Logging tamper (anti-cleaner) ----------------------------------------------------------------------
+function Get-LoggingTamperAlerts {
+    $alerts = New-Object System.Collections.Generic.List[string]
+    $boot = Get-BootTime
+    $services = [ordered]@{
+        DPS      = 'Diagnostic Policy Service (keeps run history in memory)'
+        PcaSvc   = 'Program Compatibility Assistant (launch log)'
+        SysMain  = 'SysMain (Prefetch)'
+        EventLog = 'Windows Event Log'
+        Schedule = 'Task Scheduler'
+    }
+    foreach ($name in $services.Keys) {
+        $label = $services[$name]
+        $s = $null
+        try { $s = Get-CimInstance Win32_Service -Filter "Name='$name'" -ErrorAction Stop } catch {}
+        if (-not $s) { $alerts.Add("WARNING: $label service is missing"); continue }
+        if ($s.StartMode -eq 'Disabled') { $alerts.Add("WARNING: $label is disabled (some 'debloat' tools do this; it also stops evidence being recorded)"); continue }
+        if ($s.State -ne 'Running') { $alerts.Add("WARNING: $label is not running ($($s.State))"); continue }
+        $proc = Get-Process -Id $s.ProcessId -ErrorAction SilentlyContinue
+        if (-not $proc) { continue }
+        $susp = 0
+        try { $susp = @($proc.Threads | Where-Object { [string]$_.ThreadState -eq 'Wait' -and [string]$_.WaitReason -eq 'Suspended' }).Count } catch {}
+        if ($susp -gt 0) { $alerts.Add("FAILURE: $label has $susp frozen thread(s) - it shows as running but is not recording (a known screenshare bypass)") }
+        try {
+            if ($boot -and $proc.StartTime -gt $boot.AddMinutes(10)) {
+                $alerts.Add("WARNING: $label was restarted at $(Get-Date $proc.StartTime -Format 'HH:mm'), which wipes its memory history")
+            }
+        } catch {}
+    }
+    $exp = Get-Process -Name explorer -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ($exp) {
+        $es = 0
+        try { $es = @($exp.Threads | Where-Object { [string]$_.ThreadState -eq 'Wait' -and [string]$_.WaitReason -eq 'Suspended' }).Count } catch {}
+        if ($es -gt 0) { $alerts.Add("WARNING: Explorer has $es frozen thread(s)") }
+    }
+
+    # services stopped since boot (event 7036, binary data "Name/1" = stopped)
+    if ($boot) {
+        try {
+            $evs = @(Get-WinEvent -FilterHashtable @{ LogName = 'System'; ProviderName = 'Service Control Manager'; Id = 7036; StartTime = $boot } -MaxEvents 3000 -ErrorAction Stop)
+            $stopped = @{}
+            foreach ($e in $evs) {
+                $bin = ''
+                try { $bin = [string]([xml]$e.ToXml()).Event.EventData.Binary } catch {}
+                if (-not $bin -or $bin.Length -lt 8) { continue }
+                $bytes = New-Object byte[] ($bin.Length / 2)
+                for ($i = 0; $i -lt $bytes.Length; $i++) { $bytes[$i] = [Convert]::ToByte($bin.Substring($i * 2, 2), 16) }
+                $txt = [Text.Encoding]::Unicode.GetString($bytes).TrimEnd([char]0)
+                if ($txt -match '^(DPS|PcaSvc|SysMain|EventLog|Schedule)/1$' -and -not $stopped.ContainsKey($matches[1])) {
+                    $stopped[$matches[1]] = $e.TimeCreated
+                    $alerts.Add("WARNING: $($services[$matches[1]]) was stopped at $(Get-Date $e.TimeCreated -Format 'HH:mm') this session")
+                }
+            }
+        } catch {}
+    }
+    # change journal deleted (Ntfs event 3079) in the last 30 days
+    try {
+        Get-WinEvent -FilterHashtable @{ LogName = 'Application'; Id = 3079; StartTime = (Get-Date).AddDays(-30) } -MaxEvents 3 -ErrorAction Stop | ForEach-Object {
+            $alerts.Add("FAILURE: The change journal was deleted on $(Get-Date $_.TimeCreated -Format 'yyyy-MM-dd HH:mm') (wipes file history)")
+        }
+    } catch {}
+    # policy switches that stop Windows recording program runs
+    $ac = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\AppCompat'
+    foreach ($pair in @(@('DisablePCA', 1, 'Program Compatibility Assistant logging'), @('DisableInventory', 1, 'Amcache program inventory'), @('AITEnable', 0, 'Application telemetry (feeds Amcache)'), @('DisableEngine', 1, 'Application compatibility engine'))) {
+        try {
+            $v = Get-ItemPropertyValue -Path $ac -Name $pair[0] -ErrorAction Stop
+            if ([int]$v -eq [int]$pair[1]) { $alerts.Add("WARNING: $($pair[2]) is turned off by policy ($($pair[0])=$v) - removes program history") }
+        } catch {}
+    }
+    if (-not ($alerts | Where-Object { $_ -like 'FAILURE*' -or $_ -like 'WARNING*' })) {
+        $alerts.Insert(0, 'SUCCESS: Windows evidence logging is running normally (no frozen, stopped or disabled services)')
+    }
+    return @($alerts | Select-Object -First 30)
+}
+
+# =============================================================================
+#   Tier 2: long-term history, AI aimbots, input hardware, script integrity, policy
+# =============================================================================
+
+function Copy-BsmmLockedFile {
+    param([string]$Source, [string]$Dest)
+    if (-not (Test-Path -LiteralPath $Source)) { return $false }
+    try {
+        $p = Start-Process -FilePath "$env:SystemRoot\System32\esentutl.exe" -ArgumentList @('/y', "`"$Source`"", '/vss', '/d', "`"$Dest`"") -WindowStyle Hidden -PassThru -ErrorAction Stop
+        if (-not $p.WaitForExit(90000)) { try { $p.Kill() } catch {}; return $false }
+    } catch { return $false }
+    return (Test-Path -LiteralPath $Dest)
+}
+
+# --- Long-term history: Amcache (SHA1 + compile time), SRUM (~30 days of app use), Defender MPLog ------------
+function Get-LongTermHistoryAlerts {
+    if (-not $script:Policy.DeepHistory) { return @('INFO: Long-term history scan is turned off in the policy settings') }
+    if (-not (Test-Admin)) { return @('WARNING: Long-term history needs administrator rights') }
+    if (-not (Initialize-BsmmForensics)) { return @("WARNING: Forensic engine unavailable ($script:BsmmForensicsError)") }
+    $alerts = New-Object System.Collections.Generic.List[string]
+    $volumes = Get-BsmmVolumeMap
+    $seen = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+    $amHits = New-Object System.Collections.Generic.List[object]
+    $srHits = New-Object System.Collections.Generic.List[object]
+    $mpHits = New-Object System.Collections.Generic.List[object]
+    $work = Join-Path $env:TEMP ('BSMM_hist_' + [guid]::NewGuid().ToString('N'))
+    New-Item -ItemType Directory -Path $work -Force | Out-Null
+    try {
+        # Amcache
+        $am = Join-Path $work 'amcache.hve'
+        if (Copy-BsmmLockedFile -Source "$env:SystemRoot\appcompat\Programs\Amcache.hve" -Dest $am) {
+            $hive = [BSMM.Forensics]::LoadAppHive($am)
+            if ($hive) {
+                try {
+                    $inv = $hive.OpenSubKey('Root\InventoryApplicationFile')
+                    $count = 0
+                    if ($inv) {
+                        foreach ($sub in $inv.GetSubKeyNames()) {
+                            $k = $inv.OpenSubKey($sub)
+                            if (-not $k) { continue }
+                            $path = [string]$k.GetValue('LowerCaseLongPath')
+                            $link = [string]$k.GetValue('LinkDate')
+                            $sha1 = [string]$k.GetValue('FileId')
+                            $k.Close()
+                            $count++
+                            $kw = Get-BsmmCheatKeywordFast $path
+                            if ($kw -and $seen.Add($path)) {
+                                $extra = " built $link"
+                                if ($sha1.Length -gt 4) { $extra += " sha1 $($sha1.Substring(4))" }
+                                $amHits.Add([pscustomobject]@{ Kw = $kw; Path = $path; Extra = $extra })
+                            }
+                        }
+                        $inv.Close()
+                    }
+                    Add-BsmmGroupedHits -Alerts $alerts -Level 'FAILURE' -Label 'Amcache: ran' -Hits $amHits
+                    $alerts.Add("INFO: Amcache: $count programs on record")
+                } finally { $hive.Close() }
+            } else { $alerts.Add("INFO: Amcache copy could not be opened (error $([BSMM.Forensics]::LastHiveError))") }
+        } else { $alerts.Add('INFO: Amcache could not be copied (shadow copy unavailable)') }
+
+        # SRUM
+        $sr = Join-Path $work 'srudb.dat'
+        if (Copy-BsmmLockedFile -Source "$env:SystemRoot\System32\sru\SRUDB.dat" -Dest $sr) {
+            $paths = [BSMM.Forensics]::FilePaths($sr, 2GB, 60000)
+            foreach ($raw in $paths) {
+                $extra = ''
+                if ($raw.StartsWith('!!')) { $bits = $raw.Substring(2) -split '\|', 2; $p = $bits[0]; $extra = " (file stamp $($bits[1]))" }
+                else { $p = ConvertTo-BsmmDrivePath -Path $raw -Volumes $volumes; if (-not $p) { $p = $raw } }
+                $kw = Get-BsmmCheatKeywordFast $p
+                if ($kw -and $seen.Add($p)) { $srHits.Add([pscustomobject]@{ Kw = $kw; Path = $p; Extra = $extra }) }
+            }
+            Add-BsmmGroupedHits -Alerts $alerts -Level 'FAILURE' -Label 'SRUM app history (~30 days):' -Hits $srHits
+            $alerts.Add("INFO: SRUM: $($paths.Count) programs in the last ~30 days of usage history")
+        } else { $alerts.Add('INFO: SRUM could not be copied (shadow copy unavailable)') }
+
+        # Defender MPLog
+        $mpDir = Join-Path $env:ProgramData 'Microsoft\Windows Defender\Support'
+        $logs = @(Get-ChildItem -LiteralPath $mpDir -Filter 'MPLog-*.log' -File -ErrorAction SilentlyContinue)
+        $mpCount = 0
+        foreach ($f in $logs) {
+            try {
+                foreach ($raw in [BSMM.Forensics]::FilePaths($f.FullName, 256MB, 60000)) {
+                    $mpCount++
+                    $p = ConvertTo-BsmmDrivePath -Path $raw -Volumes $volumes
+                    if (-not $p) { $p = $raw }
+                    $kw = Get-BsmmCheatKeywordFast $p
+                    if ($kw -and $seen.Add($p)) { $mpHits.Add([pscustomobject]@{ Kw = $kw; Path = $p; Extra = '' }) }
+                }
+                $txt = Read-BsmmTextFile -Path $f.FullName
+                foreach ($m in [regex]::Matches($txt, 'ProcessImageName:\s*([^,\r\n]+)')) {
+                    $n = $m.Groups[1].Value.Trim()
+                    $kw = Get-BsmmCheatKeywordFast $n
+                    if ($kw -and $seen.Add("mp|$n")) { $alerts.Add("FAILURE: Defender activity log: process [$kw] '$n' ran") }
+                }
+            } catch {}
+        }
+        Add-BsmmGroupedHits -Alerts $alerts -Level 'FAILURE' -Label 'Defender activity log:' -Hits $mpHits
+        if ($logs.Count -gt 0) { $alerts.Add("INFO: Defender activity log: $($logs.Count) file(s), $mpCount paths") }
+        elseif (Test-Admin) { $alerts.Add('WARNING: Defender activity log (MPLog) is missing - it may have been deleted') }
+    } finally {
+        Remove-Item -LiteralPath $work -Recurse -Force -ErrorAction SilentlyContinue
+    }
+    if (-not ($alerts | Where-Object { $_ -like 'FAILURE*' -or $_ -like 'WARNING*' })) {
+        $alerts.Insert(0, 'SUCCESS: No cheat names in Amcache, SRUM or the Defender activity log')
+    }
+    return @($alerts | Select-Object -First 45)
+}
+
+# --- AI / colour aimbot traces ------------------------------------------------------------------------
+function Get-AiAimbotAlerts {
+    $alerts = New-Object System.Collections.Generic.List[string]
+    $sites = New-Object System.Collections.Generic.List[string]
+    $pyRoots = @((Join-Path $env:LOCALAPPDATA 'Programs\Python'), (Join-Path $env:APPDATA 'Python'), (Join-Path $env:USERPROFILE 'anaconda3'), (Join-Path $env:USERPROFILE 'miniconda3'))
+    $pyRoots += @(Get-ChildItem -Path "$env:SystemDrive\" -Directory -Filter 'Python*' -ErrorAction SilentlyContinue | ForEach-Object { $_.FullName })
+    foreach ($r in $pyRoots) {
+        if (-not (Test-Path -LiteralPath $r)) { continue }
+        Get-ChildItem -LiteralPath $r -Directory -Recurse -Depth 4 -Filter 'site-packages' -ErrorAction SilentlyContinue | ForEach-Object { $sites.Add($_.FullName) }
+    }
+    foreach ($d in (@(Get-BsmmUserFolders Desktop) + @(Get-BsmmUserFolders Documents) + @(Get-BsmmUserFolders Downloads))) {
+        Get-ChildItem -LiteralPath $d -File -Recurse -Depth 3 -Filter 'pyvenv.cfg' -ErrorAction SilentlyContinue | ForEach-Object {
+            $sp = Join-Path $_.DirectoryName 'Lib\site-packages'
+            if (Test-Path -LiteralPath $sp) { $sites.Add($sp) }
+        }
+    }
+    foreach ($sp in @($sites | Select-Object -Unique)) {
+        $names = @(Get-ChildItem -LiteralPath $sp -Directory -ErrorAction SilentlyContinue | ForEach-Object { $_.Name.ToLower() })
+        $capture = @($names | Where-Object { $_ -match '^(bettercam|dxcam|d3dshot|windows_capture)' })
+        $ai = @($names | Where-Object { $_ -match '^(ultralytics|onnxruntime|tensorrt)' })
+        $inject = @($names | Where-Object { $_ -match '^(pydirectinput|interception|pyinterception)' })
+        if ($capture.Count -gt 0 -and $ai.Count -gt 0) {
+            $alerts.Add("WARNING: Screen-capture and AI detection libraries installed together (an aimbot toolkit): $(($capture + $ai) -join ', ') -> $sp")
+        } elseif ($ai.Count -gt 0 -and $inject.Count -gt 0) {
+            $alerts.Add("WARNING: AI detection and mouse-injection libraries installed together: $(($ai + $inject) -join ', ') -> $sp")
+        }
+    }
+    foreach ($d in (@(Get-BsmmUserFolders Desktop) + @(Get-BsmmUserFolders Documents) + @(Get-BsmmUserFolders Downloads))) {
+        Get-ChildItem -LiteralPath $d -File -Recurse -Depth 4 -Force -ErrorAction SilentlyContinue |
+            Where-Object { $_.Extension -match '^(?i)\.(onnx|engine)$' -and $_.Length -gt 1MB } | Select-Object -First 5 |
+            ForEach-Object { $alerts.Add("WARNING: AI model file (aimbots ship these) -> $($_.FullName)") }
+    }
+    # running programs that load an AI runtime (never Roblox)
+    foreach ($p in @(Get-Process -ErrorAction SilentlyContinue)) {
+        if ($p.ProcessName -match '^(?i)Roblox' -or $p.Id -eq $PID) { continue }
+        $path = $null; try { $path = $p.Path } catch {}
+        if (-not $path -or $path -match '^(?i)[a-z]:\\windows\\|\\(NVIDIA|Microsoft|CapCut|Adobe|Blackmagic|obs-studio|Microsoft Office|WindowsApps)\\') { continue }
+        $mods = @()
+        try { $mods = @($p.Modules | ForEach-Object { $_.ModuleName }) } catch { continue }
+        $aiMods = @($mods | Where-Object { $_ -match '^(?i)(onnxruntime|DirectML|nvinfer|onnxruntime_pybind11_state)' })
+        if ($aiMods.Count -gt 0) { $alerts.Add("WARNING: Running program uses an AI model runtime ($(($aiMods | Select-Object -Unique) -join ', ')) -> $($p.ProcessName) $path") }
+    }
+    if ($alerts.Count -eq 0) { $alerts.Add('SUCCESS: No AI aimbot libraries, models or running AI runtimes found') }
+    return @($alerts | Select-Object -Unique -First 20)
+}
+
+# --- Input hardware: microcontroller "mice", input boxes ---------------------------------------------------
+$script:InputBoardVids = @{
+    '2341' = 'Arduino'; '2A03' = 'Arduino'; '1B4F' = 'SparkFun Pro Micro'; '16C0' = 'Teensy / V-USB board'
+    '239A' = 'Adafruit board'; '2E8A' = 'Raspberry Pi Pico (RP2040)'; '303A' = 'Espressif ESP32 board'
+}
+function Get-InputHardwareAlerts {
+    $alerts = New-Object System.Collections.Generic.List[string]
+    $present = @{}
+    $ports = @{}; $mice = @{}
+    try {
+        foreach ($d in @(Get-CimInstance Win32_PnPEntity -ErrorAction Stop)) {
+            $id = [string]$d.DeviceID
+            if ($id -notmatch 'VID_([0-9A-Fa-f]{4})&PID_([0-9A-Fa-f]{4})') { continue }
+            $vid = $matches[1].ToUpper(); $pidv = $matches[2].ToUpper(); $key = "$vid`:$pidv"
+            $present[$key] = [string]$d.Name
+            if ($script:InputBoardVids.ContainsKey($vid) -and -not $alerts.Contains("x$key")) {
+                $alerts.Add("WARNING: Connected now: $($script:InputBoardVids[$vid]) ($key) '$($d.Name)' - these boards can pose as a mouse/keyboard for aim assistance")
+                $alerts.Add("x$key")
+            }
+            if ([string]$d.PNPClass -eq 'Ports' -and $id -like 'USB\*') { $ports[$key] = [string]$d.Name }
+            if ([string]$d.PNPClass -eq 'Mouse') { $mice[$key] = [string]$d.Name }
+        }
+    } catch { $alerts.Add('WARNING: Could not list connected devices') }
+    foreach ($k in $mice.Keys) {
+        if ($ports.ContainsKey($k)) { $alerts.Add("WARNING: Mouse that also exposes a serial port ($($k) '$($mice[$k])' + '$($ports[$k])') - typical of KMBox/MAKCU-style input boxes") }
+    }
+    try {
+        $usb = Open-LocalMachineRegistryKey -SubKeyPath 'SYSTEM\CurrentControlSet\Enum\USB'
+        if ($usb) {
+            foreach ($n in $usb.GetSubKeyNames()) {
+                if ($n -match '^VID_([0-9A-Fa-f]{4})&PID_([0-9A-Fa-f]{4})$') {
+                    $vid = $matches[1].ToUpper(); $key = "$vid`:$($matches[2].ToUpper())"
+                    if ($script:InputBoardVids.ContainsKey($vid) -and -not $present.ContainsKey($key)) {
+                        $alerts.Add("INFO: Connected in the past: $($script:InputBoardVids[$vid]) ($key)")
+                    }
+                }
+            }
+            $usb.Close()
+        }
+    } catch {}
+    $out = @($alerts | Where-Object { $_ -notlike 'x*' })
+    if (-not ($out | Where-Object { $_ -like 'WARNING*' -or $_ -like 'FAILURE*' })) { $out = @('SUCCESS: No microcontroller boards or input boxes connected') + $out }
+    return $out
+}
+
+# --- Script integrity: was the check itself tampered with? ---------------------------------------------
+$script:CodeFingerprint = ''
+function Get-ScriptIntegrityAlerts {
+    $alerts = New-Object System.Collections.Generic.List[string]
+    foreach ($o in @($script:PreRemovedOverrides)) { $alerts.Add("FAILURE: A PowerShell command was replaced before the check started ($o) - used to fake check results") }
+    if ($script:PreDefaultParams -gt 0) { $alerts.Add("WARNING: PowerShell default parameter values were pre-set ($script:PreDefaultParams) - can silently change how commands behave") }
+    foreach ($exe in @('powershell.exe', 'pwsh.exe', 'conhost.exe', 'powershell_ise.exe', 'WindowsTerminal.exe', 'OpenConsole.exe')) {
+        foreach ($root in @('SOFTWARE\Microsoft\Windows NT\CurrentVersion\Image File Execution Options', 'SOFTWARE\WOW6432Node\Microsoft\Windows NT\CurrentVersion\Image File Execution Options')) {
+            try {
+                $k = Open-LocalMachineRegistryKey -SubKeyPath "$root\$exe"
+                if ($k) {
+                    $dbg = [string]$k.GetValue('Debugger')
+                    if ($dbg) { $alerts.Add("FAILURE: $exe is hijacked (IFEO Debugger -> $dbg)") }
+                    $k.Close()
+                }
+            } catch {}
+        }
+    }
+    try {
+        foreach ($line in @(Get-Content -LiteralPath (Join-Path $env:SystemRoot 'System32\drivers\etc\hosts') -ErrorAction Stop)) {
+            $t = $line.Trim()
+            if (-not $t -or $t.StartsWith('#')) { continue }
+            if ($t -match '(?i)(github|githubusercontent|workers\.dev|cloudflare|discord)') { $alerts.Add("FAILURE: hosts file redirects $($matches[1]) - can serve a fake clean check -> $t") }
+        }
+    } catch {}
+    try {
+        $defs = (Get-ChildItem Function: | Where-Object { $_.Name -like 'Get-*Alerts' } | Sort-Object Name | ForEach-Object { $_.Name + "`n" + $_.Definition }) -join "`n"
+        $sha = [System.Security.Cryptography.SHA256]::Create()
+        $hash = $sha.ComputeHash([Text.Encoding]::UTF8.GetBytes($defs))
+        $script:CodeFingerprint = ([BitConverter]::ToString($hash) -replace '-', '').Substring(0, 16)
+        $alerts.Add("INFO: Code fingerprint $script:CodeFingerprint (the same for every unmodified copy of this version)")
+    } catch {}
+    if (-not ($alerts | Where-Object { $_ -like 'FAILURE*' -or $_ -like 'WARNING*' })) {
+        $alerts.Insert(0, 'SUCCESS: No signs that this check was hooked, redirected or modified')
+    }
+    return @($alerts)
+}
+
+# --- Security policy: settings that block kernel cheats outright -----------------------------------------
+function Get-SecurityPolicyAlerts {
+    $alerts = New-Object System.Collections.Generic.List[string]
+    $pol = $script:Policy
+    $sb = $null
+    try { $sb = Confirm-SecureBootUEFI -ErrorAction Stop } catch {}
+    if ($sb -eq $true) { $alerts.Add('SUCCESS: Secure Boot is on') }
+    elseif ($sb -eq $false) { if ($pol.RequireSecureBoot) { $alerts.Add('FAILURE: Secure Boot is off (required by league policy)') } else { $alerts.Add('WARNING: Secure Boot is off (allows boot-level cheats)') } }
+    else { $alerts.Add('INFO: Secure Boot status unavailable (legacy BIOS mode, or not run as administrator)') }
+
+    $bl = $null
+    try { $bl = Get-ItemPropertyValue -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\CI\Config' -Name VulnerableDriverBlocklistEnable -ErrorAction Stop } catch {}
+    if ($null -ne $bl -and [int]$bl -eq 0) {
+        if ($pol.RequireDriverBlocklist) { $alerts.Add('FAILURE: Vulnerable Driver Blocklist is off (required by league policy; turning it off is step one of loading kernel cheats)') }
+        else { $alerts.Add('WARNING: Vulnerable Driver Blocklist is off (turning it off is step one of loading kernel cheats)') }
+    } else { $alerts.Add('SUCCESS: Vulnerable Driver Blocklist is not turned off') }
+
+    $hvci = $null
+    try {
+        $dg = Get-CimInstance -Namespace 'root\Microsoft\Windows\DeviceGuard' -ClassName Win32_DeviceGuard -ErrorAction Stop
+        $hvci = @($dg.SecurityServicesRunning) -contains 2
+    } catch {}
+    if ($hvci -eq $true) { $alerts.Add('SUCCESS: Memory Integrity (HVCI) is running - blocks manually loaded kernel cheats') }
+    elseif ($hvci -eq $false) {
+        if ($pol.RequireMemoryIntegrity) { $alerts.Add('FAILURE: Memory Integrity (HVCI) is off (required by league policy)') }
+        else { $alerts.Add('INFO: Memory Integrity (HVCI) is off - kernel cheats can load (not required by league policy)') }
+    }
+    return @($alerts)
 }
 
 $script:ProgressWidth = 28
@@ -6097,6 +7396,7 @@ $script:SystemChecks = @(
     @{ Name = 'Windows Security Settings';    Caption = 'Checking firewall and driver blocklist'; Run = { Get-SecuritySettingAlerts } },
     @{ Name = 'Clarity / Defender Integrity'; Caption = 'Checking Defender integrity';        Run = { Get-ClarityDetectionAlerts } },
     @{ Name = 'Memory Integrity (HVCI)';      Caption = 'Checking Memory Integrity';          Run = { Get-MemoryIntegrityAlerts } },
+    @{ Name = 'Security Policy';              Caption = 'Checking Secure Boot and kernel protections'; Run = { Get-SecurityPolicyAlerts } },
     @{ Name = 'CLR Profiler Hijack';          Caption = 'Checking .NET profiler environment'; Run = { Get-ClrHijackAlerts } },
     @{ Name = 'Native Syscall Hooks';         Caption = 'Auditing NTDLL syscall stubs';       Run = { Get-NtdllSyscallIntegrityAlerts } },
     @{ Name = 'OBS & App Tamper';             Caption = 'Auditing browsers, streaming & apps'; Run = { Get-StreamingProcessIntegrityAlerts } },
@@ -6109,8 +7409,11 @@ $script:SystemChecks = @(
     @{ Name = 'Driver Install Log';           Caption = 'Reading driver install and block log';  Run = { Get-DriverInstallAlerts } },
     @{ Name = 'Input & DMA Devices';          Caption = 'Checking input drivers and PCIe';    Run = { Get-InputAndDmaDeviceAlerts } },
     @{ Name = 'Macro & Auto-Clickers';        Caption = 'Checking for macro tools';           Run = { Get-MacroToolAlerts } },
+    @{ Name = 'AI Aimbot Traces';             Caption = 'Checking for AI aimbot tools';       Run = { Get-AiAimbotAlerts } },
+    @{ Name = 'Input Hardware';               Caption = 'Checking for input boxes and boards'; Run = { Get-InputHardwareAlerts } },
     @{ Name = 'PowerShell Module Integrity';  Caption = 'Verifying PowerShell modules';       Run = { @(Get-PowerShellHostIntegrityAlerts; Get-PowerShellModuleIntegrityAlerts) | Select-Object -Unique } },
     @{ Name = 'PowerShell Binary Integrity';  Caption = 'Verifying PowerShell binaries';      Run = { Get-PowerShellBinaryIntegrityAlerts } },
+    @{ Name = 'Script Integrity';             Caption = 'Checking this check was not tampered with'; Run = { Get-ScriptIntegrityAlerts } },
     @{ Name = 'Root Certificates';            Caption = 'Checking root certificates';         Run = { Get-RootCertificateAlerts } },
     @{ Name = 'Process Scan';                 Caption = 'Scanning processes';                 Run = { @(Get-ProcessScanAlerts; Get-UnsignedUserProgramAlerts) | Select-Object -Unique } },
     @{ Name = 'External / Overlay';           Caption = 'Scanning external / overlay activity'; Run = { Get-ExternalCheatHits } },
@@ -6124,6 +7427,8 @@ $script:SystemChecks = @(
     @{ Name = 'KeyAuth';                      Caption = 'Checking KeyAuth';                   Run = { Get-KeyAuthAlerts } },
     @{ Name = 'Suspicious Files';             Caption = 'Scanning for high-entropy binaries'; Run = { Get-SuspiciousHighEntropyFileAlerts } },
     @{ Name = 'Cheat Files & Shortcuts';      Caption = 'Searching for cheat files and shortcuts'; Run = { Get-CheatFileAlerts } },
+    @{ Name = 'Service Memory Traces';        Caption = 'Reading program traces from service memory'; Run = { Get-ServiceMemoryTraceAlerts } },
+    @{ Name = 'Code Fingerprints';            Caption = 'Looking inside programs for cheat code'; Run = { Get-CodeFingerprintAlerts } },
     @{ Name = 'Download Origins';             Caption = 'Checking where downloads came from'; Run = { Get-DownloadOriginAlerts } },
     @{ Name = 'Windhawk';                     Caption = 'Checking Windhawk';                  Run = { Get-WindhawkStep1Alerts } },
     @{ Name = 'Registry Markers';             Caption = 'Checking registry markers';          Run = { Get-RegistryMarkerAlerts } },
@@ -6132,9 +7437,12 @@ $script:SystemChecks = @(
     @{ Name = 'BAM Service';                  Caption = 'Checking BAM service';               Run = { Get-BamServiceAlerts } },
 
     @{ Name = 'Prefetch Health';              Caption = 'Checking prefetch';                  Run = { Get-PrefetchHealthAlerts } },
+    @{ Name = 'Logging Tamper';               Caption = 'Checking for frozen or disabled logging'; Run = { Get-LoggingTamperAlerts } },
     @{ Name = 'Artifact Cross-Check';         Caption = 'Cross-checking BAM vs prefetch';     Run = { Get-ArtifactCrossCheckAlerts } },
     @{ Name = 'Program Launch Traces';        Caption = 'Reading Windows launch logs';        Run = { @(Get-PcaLaunchAlerts; Get-UserAssistAlerts; Get-RegistryTraceAlerts; Get-BamDeletedAlerts) } },
+    @{ Name = 'Long-term History';            Caption = 'Reading Amcache, SRUM and Defender logs'; Run = { Get-LongTermHistoryAlerts } },
     @{ Name = 'USN Journal';                  Caption = 'Checking USN change journal';        Run = { Get-UsnJournalAlerts } },
+    @{ Name = 'Change Journal Evidence';      Caption = 'Reading the file change journal';    Run = { Get-ChangeJournalAlerts } },
     @{ Name = 'Recycle Bin';                  Caption = 'Checking recently deleted files';    Run = { Get-RecycleBinAlerts } },
     @{ Name = 'System Clock';                 Caption = 'Checking for clock changes';         Run = { Get-ClockChangeAlerts } },
     @{ Name = 'Command History';              Caption = 'Scanning command history';           Run = { Get-CommandHistoryAlerts } },

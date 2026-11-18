@@ -40,6 +40,24 @@ staff (screen share or recording) until they have seen the result.
 - UAC level, window animations, OBS scripts and scene-switch/pause hotkeys
 - Virtual machines, Remote Desktop, hidden/encrypted drives
 
+The PC check also uses evidence that renaming or deleting a cheat does not remove:
+
+- **Code inside programs**: executor Lua functions, Roblox engine internals used by externals,
+  KeyAuth loader servers, protectors such as Themida/VMProtect, and the executor
+  `autoexec` + `workspace` folder layout, in files and in running (unsigned) programs
+- **Program traces in Windows' own memory** (Diagnostic Policy Service, Program Compatibility
+  Assistant, Task Scheduler, Explorer), kept since the last restart
+- **The NTFS change journal**: deleted, renamed or swapped programs, Prefetch wipes, kernel-driver drops
+- **Long-term history**: Amcache (with file hashes), SRUM (about 30 days of app use) and Defender's
+  activity log
+- **Tampering**: frozen, stopped or disabled logging services, a deleted change journal, and hooks or
+  redirects aimed at this check
+- **AI aimbots and input hardware**: screen-capture + AI libraries, model files, Arduino-style boards
+  and KMBox/MAKCU-style input boxes
+- **Kernel protection**: Secure Boot, Vulnerable Driver Blocklist and Memory Integrity
+
+A full PC check takes about 2 to 3 minutes.
+
 ## What is sent to BSMM staff
 
 Reports go to the BSMM relay (`relay/worker.js`, a Cloudflare Worker), which posts them to a staff
@@ -58,6 +76,10 @@ Everything that is sent is also shown on your screen.
 
 The checks only read. The script itself:
 
+- reads the memory of a few Windows services and of unsigned programs to look for cheat traces
+  (never Roblox's memory)
+- makes a temporary Windows shadow copy with Microsoft's `esentutl` to read the locked Amcache and
+  SRUM history files, and deletes its copies straight after
 - downloads Process Explorer from Microsoft (`download.sysinternals.com`), checks Microsoft's
   signature, and deletes it again when you close it
 - writes its own log to `C:\ProgramData\bsmm_security_events.log`
@@ -71,6 +93,11 @@ The checks only read. The script itself:
   history checks see nothing).
 - A PC that looks clean but shows wiped run history, cleared event logs or a reset change journal
   should be treated as suspicious. Windows run history only goes back about a week.
+- League policy switches are at the top of `BSMM-Check.ps1` (`RequireSecureBoot`,
+  `RequireDriverBlocklist`, `RequireMemoryIntegrity`): turn them on to make those settings a FAIL
+  instead of a warning.
+- Every report includes a **code fingerprint**. It is the same for every unmodified copy of a
+  version, so a different value means the player ran an edited script.
 - `relay/` holds the relay that keeps the Discord webhook secret. Setup steps: `relay/SETUP.md`.
 - Shared settings (brand, colours, relay address, trust score weights, cheat names) are at the top
   of **both** scripts. Change them in both.
