@@ -36,7 +36,7 @@ $script:Brand = @{
     Name    = 'BSMM'
     Product = 'Anti-Cheat'
     Mode    = 'PC check'
-    Version = '1.1.0'
+    Version = '1.2.0'
     Website = ''                     # optional, e.g. 'discord.gg/yourserver' - shown beside the logo
 }
 
@@ -2335,6 +2335,8 @@ function Get-MatchedCheatKeyword {
     )
 
     if ([string]::IsNullOrWhiteSpace($Text)) { return $null }
+    # one compiled regex rules out almost every name before the slower per-keyword loop
+    if (-not (Get-BsmmKeywordRegex).IsMatch($Text) -and -not ($FolderName -and $Text -match '(?i)(^|[\\_\s\-\.])map($|[\\_\s\-\.])')) { return $null }
     $lower = $Text.ToLower()
 
     if ($FolderName) {
@@ -6910,6 +6912,7 @@ function Get-CodeFingerprintAlerts {
 
 # --- Logging tamper (anti-cleaner) ----------------------------------------------------------------------
 function Get-LoggingTamperAlerts {
+    param([switch]$Light)
     $alerts = New-Object System.Collections.Generic.List[string]
     $boot = Get-BootTime
     $services = [ordered]@{
@@ -6945,7 +6948,7 @@ function Get-LoggingTamperAlerts {
     }
 
     # services stopped since boot (event 7036, binary data "Name/1" = stopped)
-    if ($boot) {
+    if ($boot -and -not $Light) {
         try {
             $evs = @(Get-WinEvent -FilterHashtable @{ LogName = 'System'; ProviderName = 'Service Control Manager'; Id = 7036; StartTime = $boot } -MaxEvents 3000 -ErrorAction Stop)
             $stopped = @{}
@@ -7186,7 +7189,7 @@ function Get-InputHardwareAlerts {
 $script:CodeFingerprint = ''
 function Get-ScriptIntegrityAlerts {
     $alerts = New-Object System.Collections.Generic.List[string]
-    foreach ($o in @($script:PreRemovedOverrides)) { $alerts.Add("FAILURE: A PowerShell command was replaced before the check started ($o) - used to fake check results") }
+    foreach ($o in @($script:PreRemovedOverrides | Where-Object { $_ })) { $alerts.Add("FAILURE: A PowerShell command was replaced before the check started ($o) - used to fake check results") }
     if ($script:PreDefaultParams -gt 0) { $alerts.Add("WARNING: PowerShell default parameter values were pre-set ($script:PreDefaultParams) - can silently change how commands behave") }
     foreach ($exe in @('powershell.exe', 'pwsh.exe', 'conhost.exe', 'powershell_ise.exe', 'WindowsTerminal.exe', 'OpenConsole.exe')) {
         foreach ($root in @('SOFTWARE\Microsoft\Windows NT\CurrentVersion\Image File Execution Options', 'SOFTWARE\WOW6432Node\Microsoft\Windows NT\CurrentVersion\Image File Execution Options')) {
@@ -7248,6 +7251,912 @@ function Get-SecurityPolicyAlerts {
         else { $alerts.Add('INFO: Memory Integrity (HVCI) is off - kernel cheats can load (not required by league policy)') }
     }
     return @($alerts)
+}
+
+# =============================================================================
+#   Tier 3: signature forgery, injected code, hidden streams, hypervisor / DMA
+# =============================================================================
+$script:BsmmInspectSource = @'
+using System;
+using System.Collections.Generic;
+using System.IO;
+using System.Runtime.InteropServices;
+using Microsoft.Win32.SafeHandles;
+
+namespace BSMM
+{
+    public class ProcReport
+    {
+        public int Pid;
+        public string Error;
+        public string Hollow;
+        public int FloatingPe;
+        public string FloatingPeAt;
+        public int UnbackedThreads;
+        public string UnbackedAt;
+        public int ThreadsChecked;
+    }
+
+    public static class Inspect
+    {
+        [StructLayout(LayoutKind.Sequential)]
+        struct MBI
+        {
+            public IntPtr BaseAddress;
+            public IntPtr AllocationBase;
+            public uint AllocationProtect;
+            public IntPtr RegionSize;
+            public uint State;
+            public uint Protect;
+            public uint Type;
+        }
+
+        [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+        struct WIN32_FIND_STREAM_DATA
+        {
+            public long StreamSize;
+            [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 296)]
+            public string cStreamName;
+        }
+
+        [DllImport("kernel32.dll", SetLastError = true)] static extern IntPtr OpenProcess(uint access, bool inherit, int pid);
+        [DllImport("kernel32.dll", SetLastError = true)] static extern IntPtr OpenThread(uint access, bool inherit, int tid);
+        [DllImport("kernel32.dll", SetLastError = true)] static extern bool CloseHandle(IntPtr h);
+        [DllImport("kernel32.dll", SetLastError = true)] static extern bool ReadProcessMemory(IntPtr h, IntPtr addr, byte[] buf, IntPtr size, out IntPtr read);
+        [DllImport("kernel32.dll", SetLastError = true)] static extern IntPtr VirtualQueryEx(IntPtr h, IntPtr addr, out MBI info, IntPtr len);
+        [DllImport("ntdll.dll")] static extern int NtQueryInformationThread(IntPtr h, int cls, out IntPtr info, int len, IntPtr retLen);
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)] static extern IntPtr FindFirstStreamW(string file, int level, out WIN32_FIND_STREAM_DATA data, int flags);
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)] static extern bool FindNextStreamW(IntPtr h, out WIN32_FIND_STREAM_DATA data);
+        [DllImport("kernel32.dll")] static extern bool FindClose(IntPtr h);
+        [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+        static extern SafeFileHandle CreateFile(string name, uint access, uint share, IntPtr sec, uint disposition, uint flags, IntPtr template);
+
+        [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+        struct WINTRUST_FILE_INFO { public uint cbStruct; public string pcwszFilePath; public IntPtr hFile; public IntPtr pgKnownSubject; }
+        [StructLayout(LayoutKind.Sequential)]
+        struct WINTRUST_DATA
+        {
+            public uint cbStruct; public IntPtr pPolicyCallbackData; public IntPtr pSIPClientData; public uint dwUIChoice;
+            public uint fdwRevocationChecks; public uint dwUnionChoice; public IntPtr pFile; public uint dwStateAction;
+            public IntPtr hWVTStateData; public IntPtr pwszURLReference; public uint dwProvFlags; public uint dwUIContext; public IntPtr pSignatureSettings;
+        }
+        [DllImport("wintrust.dll", CharSet = CharSet.Unicode)]
+        static extern int WinVerifyTrust(IntPtr hwnd, ref Guid action, ref WINTRUST_DATA data);
+
+        // 0 = valid. Embedded signatures only; no revocation / network lookups, so it is fast.
+        public static int VerifyFile(string path)
+        {
+            var fi = new WINTRUST_FILE_INFO();
+            fi.cbStruct = (uint)Marshal.SizeOf(typeof(WINTRUST_FILE_INFO));
+            fi.pcwszFilePath = path;
+            IntPtr pFile = Marshal.AllocHGlobal(Marshal.SizeOf(typeof(WINTRUST_FILE_INFO)));
+            Marshal.StructureToPtr(fi, pFile, false);
+            try
+            {
+                var wd = new WINTRUST_DATA();
+                wd.cbStruct = (uint)Marshal.SizeOf(typeof(WINTRUST_DATA));
+                wd.dwUIChoice = 2;
+                wd.fdwRevocationChecks = 0;
+                wd.dwUnionChoice = 1;
+                wd.pFile = pFile;
+                wd.dwProvFlags = 0x1000;
+                Guid action = new Guid("00AAC56B-CD44-11d0-8CC2-00C04FC295EE");
+                return WinVerifyTrust(new IntPtr(-1), ref action, ref wd);
+            }
+            finally { Marshal.DestroyStructure(pFile, typeof(WINTRUST_FILE_INFO)); Marshal.FreeHGlobal(pFile); }
+        }
+
+        public static string SignerName(string path)
+        {
+            try
+            {
+                var c = new System.Security.Cryptography.X509Certificates.X509Certificate2(System.Security.Cryptography.X509Certificates.X509Certificate.CreateFromSignedFile(path));
+                return c.GetNameInfo(System.Security.Cryptography.X509Certificates.X509NameType.SimpleName, false);
+            }
+            catch { return ""; }
+        }
+
+        static bool IsExec(uint p) { return (p & 0xF0) != 0 && (p & 0x100) == 0; }
+
+        static int PeOffset(byte[] b, int len)
+        {
+            if (len < 0x40 || b[0] != 0x4D || b[1] != 0x5A) return -1;
+            int pe = BitConverter.ToInt32(b, 0x3C);
+            if (pe <= 0 || pe + 0x60 > len) return -1;
+            if (b[pe] != 0x50 || b[pe + 1] != 0x45 || b[pe + 2] != 0 || b[pe + 3] != 0) return -1;
+            return pe;
+        }
+
+        static string CompareHeaders(byte[] mem, int memLen, byte[] disk, int diskLen)
+        {
+            int pd = PeOffset(disk, diskLen);
+            if (pd < 0) return null;                       // file is not a normal PE: nothing to compare
+            int pm = PeOffset(mem, memLen);
+            if (pm < 0) return "PE header missing in memory";
+            uint tsM = BitConverter.ToUInt32(mem, pm + 8), tsD = BitConverter.ToUInt32(disk, pd + 8);
+            uint sizeM = BitConverter.ToUInt32(mem, pm + 24 + 56), sizeD = BitConverter.ToUInt32(disk, pd + 24 + 56);
+            uint epM = BitConverter.ToUInt32(mem, pm + 24 + 16), epD = BitConverter.ToUInt32(disk, pd + 24 + 16);
+            if (tsM != tsD) return "build stamp differs (memory " + tsM.ToString("X") + ", file " + tsD.ToString("X") + ")";
+            if (sizeM != sizeD) return "image size differs (memory " + sizeM + ", file " + sizeD + ")";
+            if (epM != epD) return "entry point differs";
+            return null;
+        }
+
+        public static ProcReport InspectProcess(int pid, string imagePath, long imageBase, int[] threadIds)
+        {
+            var r = new ProcReport();
+            r.Pid = pid;
+            IntPtr h = OpenProcess(0x0410, false, pid);
+            if (h == IntPtr.Zero) { r.Error = "denied"; return r; }
+            try
+            {
+                if (imageBase != 0 && !string.IsNullOrEmpty(imagePath) && File.Exists(imagePath))
+                {
+                    byte[] mem = new byte[0x1000];
+                    IntPtr got;
+                    if (ReadProcessMemory(h, new IntPtr(imageBase), mem, new IntPtr(mem.Length), out got) && got.ToInt64() >= 0x200)
+                    {
+                        byte[] disk = new byte[0x1000];
+                        int n = 0;
+                        try
+                        {
+                            using (var fs = new FileStream(imagePath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete)) n = fs.Read(disk, 0, disk.Length);
+                        }
+                        catch { n = 0; }
+                        if (n > 0) r.Hollow = CompareHeaders(mem, (int)got.ToInt64(), disk, n);
+                    }
+                }
+
+                var images = new List<long[]>();
+                long addr = 0;
+                int mbiSize = Marshal.SizeOf(typeof(MBI));
+                MBI mbi;
+                byte[] head = new byte[0x400];
+                while (VirtualQueryEx(h, new IntPtr(addr), out mbi, new IntPtr(mbiSize)) != IntPtr.Zero)
+                {
+                    long b = mbi.BaseAddress.ToInt64(), size = mbi.RegionSize.ToInt64();
+                    if (size <= 0) break;
+                    if (mbi.State == 0x1000)
+                    {
+                        if (mbi.Type == 0x1000000) images.Add(new long[] { b, b + size });
+                        else if (mbi.Type == 0x20000 && IsExec(mbi.Protect) && size >= 0x1000)
+                        {
+                            IntPtr got;
+                            int peo = -1;
+                            if (ReadProcessMemory(h, new IntPtr(b), head, new IntPtr(head.Length), out got)) peo = PeOffset(head, (int)got.ToInt64());
+                            bool managed = false;
+                            if (peo >= 0)
+                            {
+                                int opt = peo + 24;
+                                int dirs = opt + (BitConverter.ToUInt16(head, opt) == 0x20B ? 112 : 96);
+                                if (dirs + 14 * 8 + 8 <= head.Length && BitConverter.ToUInt32(head, dirs + 14 * 8 + 4) > 0) managed = true;
+                            }
+                            if (peo >= 0 && !managed)
+                            {
+                                r.FloatingPe++;
+                                if (r.FloatingPeAt == null) r.FloatingPeAt = "0x" + b.ToString("X") + ", " + (size / 1024) + " KB";
+                            }
+                        }
+                    }
+                    long next = b + size;
+                    if (next <= addr) break;
+                    addr = next;
+                }
+
+                foreach (int tid in threadIds)
+                {
+                    IntPtr th = OpenThread(0x0040, false, tid);
+                    if (th == IntPtr.Zero) continue;
+                    IntPtr start;
+                    int st = NtQueryInformationThread(th, 9, out start, IntPtr.Size, IntPtr.Zero);
+                    CloseHandle(th);
+                    if (st != 0 || start == IntPtr.Zero) continue;
+                    r.ThreadsChecked++;
+                    long s = start.ToInt64();
+                    bool inImage = false;
+                    foreach (var im in images) { if (s >= im[0] && s < im[1]) { inImage = true; break; } }
+                    if (!inImage)
+                    {
+                        r.UnbackedThreads++;
+                        if (r.UnbackedAt == null) r.UnbackedAt = "0x" + s.ToString("X");
+                    }
+                }
+            }
+            finally { CloseHandle(h); }
+            return r;
+        }
+
+        // Alternate data streams other than the file's main content ("name|size").
+        public static string[] Streams(string path)
+        {
+            var list = new List<string>();
+            WIN32_FIND_STREAM_DATA d;
+            IntPtr h = FindFirstStreamW(path, 0, out d, 0);
+            if (h == new IntPtr(-1)) return list.ToArray();
+            try
+            {
+                do { if (d.cStreamName != "::$DATA") list.Add(d.cStreamName + "|" + d.StreamSize); }
+                while (FindNextStreamW(h, out d));
+            }
+            finally { FindClose(h); }
+            return list.ToArray();
+        }
+
+        // True when the stream starts with an executable header.
+        public static bool StreamIsExecutable(string path, string streamName)
+        {
+            using (SafeFileHandle h = CreateFile(path + streamName, 0x80000000, 7, IntPtr.Zero, 3, 0, IntPtr.Zero))
+            {
+                if (h.IsInvalid) return false;
+                using (var fs = new FileStream(h, FileAccess.Read))
+                {
+                    byte[] b = new byte[2];
+                    return fs.Read(b, 0, 2) == 2 && b[0] == 0x4D && b[1] == 0x5A;
+                }
+            }
+        }
+    }
+}
+'@
+
+$script:BsmmInspectError = ''
+function Initialize-BsmmInspect {
+    if ('BSMM.Inspect' -as [type]) { return $true }
+    try { Add-Type -TypeDefinition $script:BsmmInspectSource -ErrorAction Stop; return $true }
+    catch { $script:BsmmInspectError = $_.Exception.Message; return $false }
+}
+
+$script:LeakedCertSerials = @('43BB437D609866286DD839E1D00309F5', '14781BC862E8DC503A559346F5DCC518')   # NVIDIA certificates leaked in 2022
+$script:TrustedSignerPattern = '(?i)^(Roblox Corporation|Microsoft Corporation|Microsoft Windows|NVIDIA Corporation|Advanced Micro Devices|Intel Corporation|Valve|Discord Inc\.|Riot Games|Epic Games|Google LLC|Logitech|Razer)'
+$script:ImpersonatedSignerPattern = '(?i)(Roblox|Microsoft|NVIDIA|Valve|Discord|Riot|Epic Games|Google|Intel|AMD|Advanced Micro|Take-Two|Rockstar|Activision|Ubisoft|Electronic Arts|Blizzard|Bungie|Ubisoft)'
+
+function Get-BsmmSigner {
+    param($Sig)
+    if ($Sig -and $Sig.SignerCertificate -and $Sig.SignerCertificate.Subject -match 'CN=("?)([^,"]+)') { return $matches[2].Trim() }
+    return ''
+}
+
+$script:SigObjCache = @{}
+function Get-BsmmSignature {
+    param([string]$Path)
+    if ($script:SigObjCache.ContainsKey($Path)) { return $script:SigObjCache[$Path] }
+    $sig = $null
+    try { $sig = Microsoft.PowerShell.Security\Get-AuthenticodeSignature -LiteralPath $Path -ErrorAction Stop } catch {}
+    $script:SigObjCache[$Path] = $sig
+    return $sig
+}
+
+# --- Signature forgery: copied signatures, Roblox-signed loaders, DLL side-loading -------------------------
+function Get-SignatureForgeryAlerts {
+    if (-not (Initialize-BsmmForensics)) { return @("WARNING: Forensic engine unavailable ($script:BsmmForensicsError)") }
+    $alerts = New-Object System.Collections.Generic.List[string]
+    $cands = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+    $userDirs = @(Get-BsmmUserFolders Desktop) + @(Get-BsmmUserFolders Downloads) + @(Get-BsmmUserFolders Documents)
+    foreach ($d in $userDirs) {
+        Get-ChildItem -LiteralPath $d -File -Recurse -Depth 4 -Force -ErrorAction SilentlyContinue |
+            Where-Object { $_.Extension -match '^(?i)\.(exe|dll)$' } | ForEach-Object { [void]$cands.Add($_.FullName) }
+    }
+    foreach ($d in @($env:LOCALAPPDATA, $env:APPDATA)) {
+        Get-ChildItem -LiteralPath $d -Directory -Force -ErrorAction SilentlyContinue | Where-Object { $_.Name -notmatch $script:FpSkipAppData } | ForEach-Object {
+            Get-ChildItem -LiteralPath $_.FullName -File -Recurse -Depth 2 -Force -Filter '*.exe' -ErrorAction SilentlyContinue | ForEach-Object { [void]$cands.Add($_.FullName) }
+        }
+    }
+    Get-ChildItem -LiteralPath $env:TEMP -File -Recurse -Depth 1 -Force -Filter '*.exe' -ErrorAction SilentlyContinue | ForEach-Object { [void]$cands.Add($_.FullName) }
+    foreach ($p in @($script:ExecutionEvidence)) { [void]$cands.Add($p) }
+    foreach ($proc in @(Get-Process -ErrorAction SilentlyContinue)) {
+        $pp = $null; try { $pp = $proc.Path } catch {}
+        if ($pp -and $pp -notmatch '^(?i)[a-z]:\\windows\\') { [void]$cands.Add($pp) }
+    }
+
+    if (-not (Initialize-BsmmInspect)) { return @("WARNING: Process inspector unavailable ($script:BsmmInspectError)") }
+    $sw = [Diagnostics.Stopwatch]::StartNew()
+    $checked = 0
+    $verify = @{}
+    $vf = { param($f) if (-not $verify.ContainsKey($f)) { $verify[$f] = [BSMM.Inspect]::VerifyFile($f) }; $verify[$f] }
+    # user folders first, then everything else
+    $ordered = @($cands | Where-Object { $_ -match '(?i)\\Users\\' }) + @($cands | Where-Object { $_ -notmatch '(?i)\\Users\\' })
+    foreach ($path in $ordered) {
+        if ($sw.Elapsed.TotalSeconds -gt 40) { $alerts.Add('INFO: Signature check stopped at its time limit'); break }
+        if (-not ([System.IO.File]::Exists($path)) -or -not [BSMM.Forensics]::HasEmbeddedSignature($path)) { continue }
+        $checked++
+        $code = & $vf $path
+        $signer = [BSMM.Inspect]::SignerName($path)
+        $impersonated = $signer -match $script:ImpersonatedSignerPattern
+        $inRoblox = $path -match '(?i)\\(Roblox|Bloxstrap|Fishstrap)\\Versions\\'
+        $serial = ''
+        try { $serial = [System.Security.Cryptography.X509Certificates.X509Certificate]::CreateFromSignedFile($path).GetSerialNumberString().ToUpper() } catch {}
+        if ($serial -and $script:LeakedCertSerials -contains $serial) { $alerts.Add("FAILURE: Signed with the leaked NVIDIA certificate ($serial) -> $path"); continue }
+        if ($code -eq -2146869232) { $alerts.Add("FAILURE: Signature copied onto a modified file - claims to be '$signer' but the file was changed after signing -> $path"); continue }
+        if ($code -eq -2146762496) { $alerts.Add("WARNING: File carries a signature block Windows cannot read (damaged or fake signature) -> $path"); continue }
+        if ($code -eq -2146762495) {
+            if ($impersonated) { $alerts.Add("FAILURE: Signed with an expired '$signer' certificate - cheats reuse stolen or leaked publisher certificates -> $path") }
+            continue
+        }
+        if ($code -ne 0) {
+            if ($impersonated) { $alerts.Add("FAILURE: Fake '$signer' signature (Windows does not trust it, code 0x$('{0:X8}' -f $code)) -> $path") }
+            elseif ($code -ne -2146762486) { $alerts.Add("WARNING: Signature not trusted by Windows (code 0x$('{0:X8}' -f $code), '$signer') -> $path") }
+            continue
+        }
+        if ($impersonated -and -not (Test-SignedByShippedRoot -Path $path)) {
+            $alerts.Add("FAILURE: '$signer' signature made with a certificate only trusted on this PC (self-made root) -> $path")
+            continue
+        }
+        if ($signer -match '^(?i)Roblox Corporation' -and -not $inRoblox -and ([IO.Path]::GetFileName($path) -notmatch '^(?i)Roblox(Player|Studio)Installer')) {
+            $dir2 = [IO.Path]::GetDirectoryName($path)
+            $foreign = @(Get-ChildItem -LiteralPath $dir2 -File -Filter '*.dll' -Force -ErrorAction SilentlyContinue | Where-Object {
+                -not ((& $vf $_.FullName) -eq 0 -and ([BSMM.Inspect]::SignerName($_.FullName)) -match $script:TrustedSignerPattern)
+            })
+            if ($foreign.Count -gt 0) { $alerts.Add("FAILURE: Roblox-signed program next to foreign DLL(s) $(($foreign | Select-Object -First 3 | ForEach-Object Name) -join ', ') - side-loading borrows Roblox's signature to run a cheat -> $path") }
+            else { $alerts.Add("WARNING: Copy of a Roblox-signed program outside Roblox's folders -> $path") }
+            continue
+        }
+        if ($path -match '(?i)\.exe$' -and $path -notmatch '(?i)\\Program Files') {
+            $dir3 = [IO.Path]::GetDirectoryName($path)
+            foreach ($dll in @(Get-ChildItem -LiteralPath $dir3 -File -Filter '*.dll' -Force -ErrorAction SilentlyContinue)) {
+                if ($script:ProxyDllNames -notcontains $dll.Name.ToLower()) { continue }
+                if ((& $vf $dll.FullName) -ne 0) { $alerts.Add("FAILURE: Signed program '$([IO.Path]::GetFileName($path))' ($signer) next to an unsigned '$($dll.Name)' - DLL side-loading -> $dir3") }
+            }
+        }
+    }    $alerts.Add("INFO: Checked $checked signed programs")
+    if (-not ($alerts | Where-Object { $_ -like 'FAILURE*' -or $_ -like 'WARNING*' })) {
+        $alerts.Insert(0, 'SUCCESS: No copied, fake or borrowed signatures found')
+    }
+    return @($alerts | Select-Object -Unique -First 30)
+}
+
+# --- Injected code: hollowed processes, manually loaded DLLs, threads in code that belongs to no file ---------
+$script:InjectSkipNames = '^(?i)(Roblox.*|System|Idle|Registry|Secure System|Memory Compression|MsMpEng|NisSrv|MpDefenderCoreService|csrss|smss|wininit|services|lsass|.*Iso|vmmem.*)$'
+function Get-InjectedCodeAlerts {
+    param([int[]]$OnlyPids = @(), [switch]$NoModules)
+    if (-not (Initialize-BsmmInspect)) { return @("WARNING: Process inspector unavailable ($script:BsmmInspectError)") }
+    try { [System.Diagnostics.Process]::EnterDebugMode() } catch {}
+    $alerts = New-Object System.Collections.Generic.List[string]
+    $inspected = 0
+    foreach ($p in @(Get-Process -ErrorAction SilentlyContinue)) {
+        if ($p.Id -le 4 -or $p.Id -eq $PID -or $p.ProcessName -match $script:InjectSkipNames) { continue }
+        if ($OnlyPids.Count -gt 0 -and $OnlyPids -notcontains $p.Id) { continue }
+        $path = $null; $base = [long]0
+        try { $path = $p.Path } catch {}
+        try { $base = $p.MainModule.BaseAddress.ToInt64() } catch {}
+        $tids = @()
+        try { $tids = @($p.Threads | ForEach-Object { $_.Id }) } catch {}
+        $r = $null
+        try { $r = [BSMM.Inspect]::InspectProcess($p.Id, [string]$path, $base, [int[]]$tids) } catch { continue }
+        if (-not $r -or $r.Error) { continue }
+        $inspected++
+        $who = "$($p.ProcessName) (PID $($p.Id))"
+        if ($path) { $who += " $path" }
+        if ($r.Hollow) { $alerts.Add("FAILURE: Running program does not match its file on disk ($($r.Hollow)) - hollowed or replaced process -> $who") }
+        if ($r.FloatingPe -gt 0) { $alerts.Add("WARNING: $($r.FloatingPe) program image(s) loaded outside any file ($($r.FloatingPeAt)) - how manually mapped cheat DLLs look -> $who") }
+        if ($r.UnbackedThreads -gt 0) { $alerts.Add("WARNING: $($r.UnbackedThreads) thread(s) started in code that belongs to no file (first at $($r.UnbackedAt)) - injected code -> $who") }
+
+        # running from a USB stick / network share
+        if ($path) {
+            try {
+                if ($path.StartsWith('\\')) { $alerts.Add("WARNING: Program running from a network share -> $who") }
+                else {
+                    $dt = ([System.IO.DriveInfo]::new($path.Substring(0, 3))).DriveType
+                    if ($dt -eq 'Removable' -or $dt -eq 'Network') { $alerts.Add("WARNING: Program running from a $($dt.ToString().ToLower()) drive -> $who") }
+                }
+            } catch {}
+        }
+
+        # unsigned DLLs from user folders loaded into a signed program (side-loading / injection)
+        if (-not $NoModules -and $path -and (Get-CachedSignatureStatus -Path $path) -eq 'Valid') {
+            $mods = @()
+            try { $mods = @($p.Modules | ForEach-Object { $_.FileName }) } catch {}
+            foreach ($m in $mods) {
+                if (-not $m -or $m -notmatch '(?i)\\(Users|ProgramData)\\' -or $m -match '(?i)\\AppData\\Local\\Microsoft\\') { continue }
+                if ((Get-CachedSignatureStatus -Path $m) -ne 'Valid') {
+                    $alerts.Add("WARNING: Unsigned DLL from a user folder loaded into signed program $($p.ProcessName) -> $m")
+                }
+            }
+        }
+    }
+    $alerts.Add("INFO: Inspected $inspected running programs")
+    if (-not ($alerts | Where-Object { $_ -like 'FAILURE*' -or $_ -like 'WARNING*' })) {
+        $alerts.Insert(0, 'SUCCESS: No hollowed programs, hidden code or injected threads found')
+    }
+    return @($alerts | Select-Object -Unique -First 30)
+}
+
+# --- Programs hidden inside alternate data streams -------------------------------------------------------
+$script:BenignStreams = '^(?i):(Zone\.Identifier|SmartScreen|com\.dropbox\.[^:]*|ms-properties|OECustomProperty|encryptable|favicon|AFP_AfpInfo|Win32App_1|KAVICHS|\$OBJECT_ID|CA_INOC|TASKICON):'
+function Get-HiddenStreamAlerts {
+    if (-not (Initialize-BsmmInspect)) { return @("WARNING: Process inspector unavailable ($script:BsmmInspectError)") }
+    $alerts = New-Object System.Collections.Generic.List[string]
+    $roots = @(Get-BsmmUserFolders Desktop) + @(Get-BsmmUserFolders Downloads) + @(Get-BsmmUserFolders Documents) + @($env:TEMP, $env:LOCALAPPDATA, $env:APPDATA)
+    $sw = [Diagnostics.Stopwatch]::StartNew()
+    $checked = 0
+    foreach ($r in $roots) {
+        $depth = 3; if ($r -eq $env:LOCALAPPDATA -or $r -eq $env:APPDATA) { $depth = 1 }
+        foreach ($item in @(Get-ChildItem -LiteralPath $r -Recurse -Depth $depth -Force -ErrorAction SilentlyContinue)) {
+            if ($sw.Elapsed.TotalSeconds -gt 20) { break }
+            $checked++
+            $streams = @()
+            try { $streams = [BSMM.Inspect]::Streams($item.FullName) } catch { continue }
+            foreach ($s in $streams) {
+                $bits = $s -split '\|'; $name = $bits[0]; $size = [long]$bits[1]
+                if ($name -match $script:BenignStreams) { continue }
+                $exe = $false
+                try { $exe = [BSMM.Inspect]::StreamIsExecutable($item.FullName, $name) } catch {}
+                if ($exe) { $alerts.Add("FAILURE: Program hidden inside the hidden data stream '$name' of -> $($item.FullName)") }
+                elseif ($size -gt 64KB) { $alerts.Add("WARNING: $([Math]::Round($size / 1KB)) KB of data hidden in stream '$name' of -> $($item.FullName)") }
+            }
+        }
+    }
+    $alerts.Add("INFO: Checked hidden streams on $checked files and folders")
+    if (-not ($alerts | Where-Object { $_ -like 'FAILURE*' -or $_ -like 'WARNING*' })) { $alerts.Insert(0, 'SUCCESS: No programs hidden in alternate data streams') }
+    return @($alerts | Select-Object -First 25)
+}
+
+# --- Hypervisor and DMA hardware -------------------------------------------------------------------------
+$script:KnownPciVendors = @('8086','1022','1002','10DE','10EC','14E4','168C','17CB','14C3','144D','1B4B','1B21','1912','1987','15B7','1C5C','126F','1E0F','1344','2646','1CC1','1E4B','1B73','104C','1106','1217','1180','11AB','1969','1102','1414','15AD','80EE','1AF4','1D6A','1CD7','1461','BDBD','1D0F','1B36','1179','1DBE','1F40','1E95','1D79','1217','105A','1000','9005','19E5','1D17','1D94')
+function Get-HypervisorDmaAlerts {
+    $alerts = New-Object System.Collections.Generic.List[string]
+    $hv = $null; $vm = $false
+    try {
+        $cs = Get-CimInstance Win32_ComputerSystem -ErrorAction Stop
+        $hv = [bool]$cs.HypervisorPresent
+        $vm = "$($cs.Manufacturer) $($cs.Model)" -match '(?i)VMware|VirtualBox|innotek|QEMU|\bKVM\b|\bXen\b|Parallels|Virtual Machine'
+    } catch {}
+    $vbs = $false
+    try { $vbs = [int](Get-CimInstance -Namespace 'root\Microsoft\Windows\DeviceGuard' -ClassName Win32_DeviceGuard -ErrorAction Stop).VirtualizationBasedSecurityStatus -eq 2 } catch {}
+    $launch = ''
+    try {
+        $out = & "$env:SystemRoot\System32\bcdedit.exe" /enum '{current}' 2>$null | Out-String
+        if ($out -match '(?im)^\s*hypervisorlaunchtype\s+(\S+)') { $launch = $matches[1] }
+    } catch {}
+    if ($hv -eq $true -and -not $vm) {
+        if ($vbs -or $launch -match '(?i)^auto') { $alerts.Add("INFO: Windows' own hypervisor is running (Core Isolation / Hyper-V / WSL)") }
+        elseif ($launch) { $alerts.Add("FAILURE: A hypervisor is running underneath Windows, but Windows did not start one (VBS off, hypervisor launch '$launch') - hypervisor cheats run this way") }
+        else { $alerts.Add('WARNING: A hypervisor is running underneath Windows and its source could not be confirmed (run as administrator)') }
+    }
+
+    # PCIe devices that do not work or lack a driver (DMA cards often show up this way), and rare vendors
+    try {
+        foreach ($d in @(Get-CimInstance Win32_PnPEntity -ErrorAction Stop | Where-Object { [string]$_.DeviceID -like 'PCI\VEN_*' })) {
+            if ([string]$d.DeviceID -notmatch 'VEN_([0-9A-Fa-f]{4})&DEV_([0-9A-Fa-f]{4})') { continue }
+            $ven = $matches[1].ToUpper(); $dev = $matches[2].ToUpper()
+            if ($script:FpgaPciVendorIds.ContainsKey($ven)) { continue }   # reported by the Input & DMA Devices check
+            $err = [int]$d.ConfigManagerErrorCode
+            if ($err -ne 0) { $alerts.Add("WARNING: PCIe device not working (error $err): '$($d.Name)' ($ven`:$dev) - DMA cheat cards often show up as a broken or driverless device") }
+            elseif ($script:KnownPciVendors -notcontains $ven) { $alerts.Add("INFO: PCIe device from an uncommon vendor: '$($d.Name)' ($ven`:$dev)") }
+        }
+    } catch { $alerts.Add('WARNING: Could not list PCIe devices') }
+    if (-not ($alerts | Where-Object { $_ -like 'FAILURE*' -or $_ -like 'WARNING*' })) { $alerts.Insert(0, 'SUCCESS: No hidden hypervisor or broken PCIe devices') }
+    return @($alerts | Select-Object -First 20)
+}
+
+# =============================================================================
+#   Tier 4: Roblox bridges and proxies, Roblox logs, kernel integrity, trust store,
+#   screen capture, input filters, log/ACL tampering
+# =============================================================================
+$script:BsmmKernSource = @'
+using System;
+using System.Collections.Generic;
+using System.Runtime.InteropServices;
+
+namespace BSMM
+{
+    public static class Kern
+    {
+        [DllImport("ntdll.dll")] static extern int NtQuerySystemInformation(int cls, IntPtr buf, int len, out int ret);
+        [DllImport("iphlpapi.dll")] static extern uint GetExtendedTcpTable(IntPtr table, ref int size, bool order, int af, int tableClass, int reserved);
+        [DllImport("kernel32.dll")] static extern IntPtr OpenProcess(uint access, bool inherit, int pid);
+        [DllImport("kernel32.dll")] static extern bool GetExitCodeProcess(IntPtr h, out uint code);
+        [DllImport("kernel32.dll")] static extern bool CloseHandle(IntPtr h);
+        [DllImport("kernel32.dll", CharSet = CharSet.Ansi)] static extern IntPtr GetProcAddress(IntPtr module, string name);
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode)] static extern IntPtr GetModuleHandle(string name);
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode)] static extern IntPtr LoadLibrary(string name);
+
+        // SYSTEM_CODEINTEGRITY_INFORMATION (class 103). 0xFFFFFFFF = query failed.
+        public static uint CodeIntegrityOptions()
+        {
+            IntPtr b = Marshal.AllocHGlobal(8);
+            try
+            {
+                Marshal.WriteInt32(b, 0, 8);
+                Marshal.WriteInt32(b, 4, 0);
+                int ret;
+                if (NtQuerySystemInformation(103, b, 8, out ret) != 0) return 0xFFFFFFFF;
+                return (uint)Marshal.ReadInt32(b, 4);
+            }
+            finally { Marshal.FreeHGlobal(b); }
+        }
+
+        // SYSTEM_KERNEL_DEBUGGER_INFORMATION (class 35) plus KUSER_SHARED_DATA.KdDebuggerEnabled.
+        public static bool KernelDebuggerEnabled()
+        {
+            bool on = false;
+            IntPtr b = Marshal.AllocHGlobal(2);
+            try
+            {
+                int ret;
+                if (NtQuerySystemInformation(35, b, 2, out ret) == 0 && Marshal.ReadByte(b, 0) != 0) on = true;
+            }
+            finally { Marshal.FreeHGlobal(b); }
+            try { if ((Marshal.ReadByte(new IntPtr(0x7FFE02D4)) & 1) != 0) on = true; } catch { }
+            return on;
+        }
+
+        // Live processes that answer by PID but are missing from the normal process list (DKOM hiding).
+        public static int[] HiddenPids(int[] listed)
+        {
+            var set = new HashSet<int>(listed);
+            var hidden = new List<int>();
+            for (int pid = 8; pid < 0x40000; pid += 4)
+            {
+                if (set.Contains(pid)) continue;
+                IntPtr h = OpenProcess(0x1000, false, pid);
+                if (h == IntPtr.Zero) continue;
+                uint code;
+                if (GetExitCodeProcess(h, out code) && code == 259) hidden.Add(pid);
+                CloseHandle(h);
+            }
+            return hidden.ToArray();
+        }
+
+        static string Ip(uint a) { return (a & 0xFF) + "." + ((a >> 8) & 0xFF) + "." + ((a >> 16) & 0xFF) + "." + ((a >> 24) & 0xFF); }
+        static int Port(int p) { return ((p & 0xFF) << 8) | ((p >> 8) & 0xFF); }
+
+        // IPv4 TCP table: "state|localIp|localPort|remoteIp|remotePort|pid" (state 2 = LISTEN, 5 = ESTABLISHED)
+        public static string[] TcpTable()
+        {
+            var list = new List<string>();
+            for (int attempt = 0; attempt < 3; attempt++)
+            {
+                int size = 0;
+                GetExtendedTcpTable(IntPtr.Zero, ref size, false, 2, 5, 0);
+                size += 4096;
+                IntPtr b = Marshal.AllocHGlobal(size);
+                try
+                {
+                    if (GetExtendedTcpTable(b, ref size, false, 2, 5, 0) != 0) continue;
+                    int n = Marshal.ReadInt32(b);
+                    for (int i = 0; i < n; i++)
+                    {
+                        IntPtr row = new IntPtr(b.ToInt64() + 4 + i * 24);
+                        list.Add((uint)Marshal.ReadInt32(row, 0) + "|" + Ip((uint)Marshal.ReadInt32(row, 4)) + "|" + Port(Marshal.ReadInt32(row, 8)) + "|" +
+                                 Ip((uint)Marshal.ReadInt32(row, 12)) + "|" + Port(Marshal.ReadInt32(row, 16)) + "|" + Marshal.ReadInt32(row, 20));
+                    }
+                    return list.ToArray();
+                }
+                finally { Marshal.FreeHGlobal(b); }
+            }
+            return list.ToArray();
+        }
+
+        // Detects the classic AMSI / ETW "patch to return" tricks in THIS process.
+        public static string ProloguePatch(string dll, string fn)
+        {
+            IntPtr m = GetModuleHandle(dll);
+            if (m == IntPtr.Zero) m = LoadLibrary(dll);
+            if (m == IntPtr.Zero) return null;
+            IntPtr p = GetProcAddress(m, fn);
+            if (p == IntPtr.Zero) return null;
+            byte b0 = Marshal.ReadByte(p), b1 = Marshal.ReadByte(p, 1), b2 = Marshal.ReadByte(p, 2);
+            if (b0 == 0xC3) return "patched to return immediately";
+            if (b0 == 0x33 && b1 == 0xC0 && b2 == 0xC3) return "patched to return 0";
+            if (b0 == 0xB8 && Marshal.ReadByte(p, 5) == 0xC3) return "patched to return a fixed value";
+            if (b0 == 0xE9 || (b0 == 0xFF && b1 == 0x25)) return "redirected (hooked)";
+            return null;
+        }
+    }
+}
+'@
+$script:BsmmKernError = ''
+function Initialize-BsmmKern {
+    if ('BSMM.Kern' -as [type]) { return $true }
+    try { Add-Type -TypeDefinition $script:BsmmKernSource -ErrorAction Stop; return $true }
+    catch { $script:BsmmKernError = $_.Exception.Message; return $false }
+}
+
+# --- Roblox talking to a local program (executor bridge) or a traffic proxy --------------------------------
+$script:BridgeAllowSigners = '(?i)(Kaspersky|AVAST|AVG|ESET|Bitdefender|Malwarebytes|Norton|McAfee|Sophos|Trend Micro|Avira|F-Secure|Microsoft|NVIDIA|Discord|Overwolf|ExitLag|Valve)'
+function Get-RobloxBridgeAlerts {
+    if (-not (Initialize-BsmmKern)) { return @("WARNING: Kernel helper unavailable ($script:BsmmKernError)") }
+    $alerts = New-Object System.Collections.Generic.List[string]
+    $rows = @([BSMM.Kern]::TcpTable() | ForEach-Object { $f = $_ -split '\|'; [pscustomobject]@{ State = [int]$f[0]; LIp = $f[1]; LPort = [int]$f[2]; RIp = $f[3]; RPort = [int]$f[4]; Pid = [int]$f[5] } })
+    $rbx = @{}
+    foreach ($p in @(Get-Process -ErrorAction SilentlyContinue | Where-Object { $_.ProcessName -match '^(?i)Roblox(PlayerBeta|Studio)' })) { $rbx[$p.Id] = $true }
+    $listeners = @{}
+    foreach ($r in $rows) { if ($r.State -eq 2) { $listeners[$r.LPort] = $r.Pid } }
+    $describe = {
+        param($procId)
+        $pp = Get-Process -Id $procId -ErrorAction SilentlyContinue
+        $path = $null; try { $path = $pp.Path } catch {}
+        [pscustomobject]@{ Name = $(if ($pp) { $pp.ProcessName } else { "PID $procId" }); Path = $path }
+    }
+    if ($listeners.ContainsKey(58443)) {
+        $d = & $describe $listeners[58443]
+        $alerts.Add("FAILURE: A program is listening on port 58443, the port of the Fleasion Roblox traffic proxy -> $($d.Name) $($d.Path)")
+    }
+    $seen = @{}
+    foreach ($r in $rows) {
+        if (-not $rbx.ContainsKey($r.Pid) -or $r.RIp -notmatch '^127\.') { continue }
+        if (-not $listeners.ContainsKey($r.RPort)) { continue }
+        $owner = $listeners[$r.RPort]
+        if ($rbx.ContainsKey($owner) -or $seen.ContainsKey($owner)) { continue }
+        $seen[$owner] = $true
+        $d = & $describe $owner
+        $signer = ''
+        if ($d.Path -and (Initialize-BsmmInspect) -and [BSMM.Inspect]::VerifyFile($d.Path) -eq 0) { $signer = [BSMM.Inspect]::SignerName($d.Path) }
+        if ($signer -and $signer -match $script:BridgeAllowSigners) { $alerts.Add("INFO: Roblox is connected to local program $($d.Name) ($signer) on port $($r.RPort)") }
+        else { $alerts.Add("FAILURE: Roblox is connected to a local program on this PC (port $($r.RPort)) - how executors like Xeno and traffic proxies talk to Roblox -> $($d.Name) $($d.Path)") }
+    }
+    if ($rbx.Count -eq 0) { $alerts.Add('INFO: Roblox is not running - the bridge check works best while Roblox is open') }
+    if (-not ($alerts | Where-Object { $_ -like 'FAILURE*' -or $_ -like 'WARNING*' })) { $alerts.Insert(0, 'SUCCESS: Roblox is not connected to any local program or proxy') }
+    return @($alerts)
+}
+
+# --- Roblox tampering: certificate list, cert pinning flag, Hyperion's own logs -------------------------------
+function Get-RobloxTamperAlerts {
+    $alerts = New-Object System.Collections.Generic.List[string]
+    $roots = @('Roblox', 'Bloxstrap', 'Fishstrap', 'Froststrap', 'Voidstrap') | ForEach-Object { Join-Path $env:LOCALAPPDATA "$_\Versions" }
+    if (${env:ProgramFiles(x86)}) { $roots += (Join-Path ${env:ProgramFiles(x86)} 'Roblox\Versions') }
+    $counts = @{}
+    foreach ($r in $roots) {
+        if (-not (Test-Path -LiteralPath $r)) { continue }
+        foreach ($v in @(Get-ChildItem -LiteralPath $r -Directory -ErrorAction SilentlyContinue)) {
+            $exe = Join-Path $v.FullName 'RobloxPlayerBeta.exe'
+            $pem = Join-Path $v.FullName 'ssl\cacert.pem'
+            if (-not (Test-Path -LiteralPath $exe) -or -not (Test-Path -LiteralPath $pem)) { continue }
+            $txt = ''
+            try { $txt = [IO.File]::ReadAllText($pem) } catch {}
+            $n = ([regex]::Matches($txt, 'BEGIN CERTIFICATE')).Count
+            $counts[$v.FullName] = $n
+            if ((Get-Item -LiteralPath $pem).LastWriteTime -gt (Get-Item -LiteralPath $exe).LastWriteTime.AddMinutes(30)) {
+                $alerts.Add("FAILURE: Roblox's trusted-certificate list was edited after install ($n certificates) - traffic proxies like Fleasion do this -> $pem")
+            }
+        }
+    }
+    if (@($counts.Values | Select-Object -Unique).Count -gt 1) {
+        $alerts.Add("WARNING: Roblox version folders have different certificate lists ($((@($counts.Values | Select-Object -Unique)) -join ' vs ') certificates)")
+    }
+    $flagFiles = @((Join-Path $env:TEMP 'Roblox\cache\flag_cache.dat'), (Join-Path $env:LOCALAPPDATA 'Roblox\ClientSettings\ClientAppSettings.json'))
+    foreach ($r in $roots) { if (Test-Path -LiteralPath $r) { $flagFiles += @(Get-ChildItem -LiteralPath $r -Recurse -Depth 2 -Filter 'ClientAppSettings.json' -ErrorAction SilentlyContinue | ForEach-Object { $_.FullName }) } }
+    foreach ($app in @('Bloxstrap', 'Fishstrap', 'Froststrap', 'Voidstrap')) { $flagFiles += (Join-Path $env:LOCALAPPDATA "$app\Modifications\ClientSettings\ClientAppSettings.json") }
+    foreach ($f in @($flagFiles | Select-Object -Unique)) {
+        if (-not (Test-Path -LiteralPath $f)) { continue }
+        $txt = ''
+        try { $txt = [IO.File]::ReadAllText($f) } catch {}
+        if ($txt -match '(?i)"DFFlagHttpUseEmbeddedCaCerts"\s*:\s*"?false') { $alerts.Add("FAILURE: Roblox certificate pinning is switched off (DFFlagHttpUseEmbeddedCaCerts=False) - lets a proxy read and change Roblox traffic -> $f") }
+    }
+
+    # Roblox's own logs: DLLs Hyperion refused to load, and requests to a local server
+    $logDir = Join-Path $env:LOCALAPPDATA 'Roblox\logs'
+    $volumes = Get-BsmmVolumeMap
+    $blocked = @{}; $local = 0; $files = 0
+    foreach ($f in @(Get-ChildItem -LiteralPath $logDir -Filter '*.log' -File -ErrorAction SilentlyContinue | Where-Object { $_.LastWriteTime -gt (Get-Date).AddDays(-14) -and $_.Name -match '(?i)player' } | Sort-Object LastWriteTime -Descending | Select-Object -First 40)) {
+        $files++
+        $txt = ''
+        try { $fs = [IO.File]::Open($f.FullName, 'Open', 'Read', 'ReadWrite'); $sr = New-Object IO.StreamReader($fs); $txt = $sr.ReadToEnd(); $sr.Close() } catch { continue }
+        foreach ($m in [regex]::Matches($txt, '(?i)Blocked DLL:\s*([^\r\n]+)')) {
+            $raw = $m.Groups[1].Value.Trim()
+            $p = ConvertTo-BsmmDrivePath -Path $raw -Volumes $volumes
+            if (-not $p) { $p = $raw }
+            if ($p -match '(?i)^[a-z]:\\(windows|program files)' ) { continue }
+            if (-not $blocked.ContainsKey($p)) { $blocked[$p] = Get-Date $f.LastWriteTime -Format 'yyyy-MM-dd HH:mm' }
+        }
+        $local += @([regex]::Matches($txt, '(?i)HttpTraceError[^\r\n]*(127\.0\.0\.1|localhost)[^\r\n]*') | Where-Object { $_.Value -notmatch '(?i)/api/rojo|:3487[0-9]' }).Count
+    }
+    foreach ($k in $blocked.Keys) { $alerts.Add("FAILURE: Roblox's anti-cheat blocked a DLL from loading into Roblox ($($blocked[$k])) -> $k") }
+    if ($local -gt 0) { $alerts.Add("WARNING: Roblox tried to reach a server on this PC $local time(s) (executor bridges run a local server)") }
+    if ($files -eq 0 -and (Test-Path -LiteralPath (Join-Path $env:LOCALAPPDATA 'Roblox\Versions'))) { $alerts.Add('INFO: No Roblox game logs from the last 14 days') }
+    else { $alerts.Add("INFO: Read $files Roblox log file(s)") }
+    if (-not ($alerts | Where-Object { $_ -like 'FAILURE*' -or $_ -like 'WARNING*' })) { $alerts.Insert(0, 'SUCCESS: Roblox install, certificate pinning and logs show no tampering') }
+    return @($alerts | Select-Object -First 25)
+}
+
+# --- Kernel integrity: debugger, hidden processes, test mode, PatchGuard, signing infrastructure, AMSI/ETW -----
+function Get-KernelIntegrityAlerts {
+    param([switch]$Light)
+    $alerts = New-Object System.Collections.Generic.List[string]
+    if (-not (Initialize-BsmmKern)) { return @("WARNING: Kernel helper unavailable ($script:BsmmKernError)") }
+    $ci = [BSMM.Kern]::CodeIntegrityOptions()
+    if ($ci -ne [uint32]::MaxValue) {
+        if (($ci -band 0x2) -ne 0) { $alerts.Add('FAILURE: Windows is in test-signing mode (kernel reports it) - any self-signed driver can load') }
+        if (($ci -band 0x80) -ne 0) { $alerts.Add('FAILURE: Code integrity debug mode is on (kernel reports it)') }
+    }
+    if ([BSMM.Kern]::KernelDebuggerEnabled()) { $alerts.Add('FAILURE: Kernel debugging is enabled - lets kernel memory be read and patched') }
+    foreach ($pair in @(@('amsi.dll', 'AmsiScanBuffer'), @('ntdll.dll', 'EtwEventWrite'), @('ntdll.dll', 'NtTraceEvent'))) {
+        try { $res = [BSMM.Kern]::ProloguePatch($pair[0], $pair[1]) } catch { $res = $null }
+        if ($res) {
+            $lvl = 'FAILURE'; if ($res -like 'redirected*') { $lvl = 'WARNING' }
+            $alerts.Add("${lvl}: $($pair[1]) in this check's own process is $res - used to blind security logging")
+        }
+    }
+    try {
+        $before = @(Get-Process -ErrorAction SilentlyContinue | ForEach-Object { $_.Id })
+        foreach ($h in @([BSMM.Kern]::HiddenPids([int[]]$before))) {
+            $visible = $false
+            try { [void][System.Diagnostics.Process]::GetProcessById($h); $visible = $true } catch {}
+            if (-not $visible) { $alerts.Add("FAILURE: Hidden running process (PID $h) - answers by ID but is missing from the process list (kernel-level hiding)") }
+        }
+    } catch {}
+    if ($Light) {
+        if (-not ($alerts | Where-Object { $_ -like 'FAILURE*' -or $_ -like 'WARNING*' })) { $alerts.Insert(0, 'SUCCESS: Kernel state looks normal') }
+        return @($alerts)
+    }
+
+    # signature-verification plumbing (hijacked = forged signatures show as valid)
+    $expect = @(
+        @('SOFTWARE\Microsoft\Cryptography\OID\EncodingType 0\CryptSIPDllVerifyIndirectData\{C689AAB8-8E78-11D0-8C47-00C04FC295EE}', 'Dll', 'WINTRUST.DLL', 'FuncName', 'CryptSIPVerifyIndirectData'),
+        @('SOFTWARE\Microsoft\Cryptography\OID\EncodingType 0\CryptSIPDllGetSignedDataMsg\{C689AAB8-8E78-11D0-8C47-00C04FC295EE}', 'Dll', 'WINTRUST.DLL', 'FuncName', 'CryptSIPGetSignedDataMsg'),
+        @('SOFTWARE\Microsoft\Cryptography\Providers\Trust\FinalPolicy\{00AAC56B-CD44-11D0-8CC2-00C04FC295EE}', '$DLL', 'WINTRUST.DLL', '$Function', 'SoftpubAuthenticode')
+    )
+    foreach ($view in @('', 'WOW6432Node\')) {
+        foreach ($e in $expect) {
+            $sub = $e[0] -replace '^SOFTWARE\\', "SOFTWARE\$view"
+            try {
+                $k = Open-LocalMachineRegistryKey -SubKeyPath $sub
+                if (-not $k) { continue }
+                $dll = [IO.Path]::GetFileName([string]$k.GetValue($e[1])); $fn = [string]$k.GetValue($e[3])
+                $k.Close()
+                if ($dll -and ($dll -ne $e[2] -or $fn -ne $e[4])) { $alerts.Add("FAILURE: Windows signature checking has been rerouted ($dll!$fn) - makes forged signatures look valid -> HKLM\$sub") }
+            } catch {}
+        }
+    }
+
+    # drivers: leaked certificates, fake-timestamp signing tools, missing files
+    if (Initialize-BsmmForensics) {
+        $m = [BSMM.Matcher]::new([string[]]@('JemmyLoveJenny', 'Fake Timestamp Responder'))
+        try {
+            foreach ($drv in @(Get-CimInstance Win32_SystemDriver -Filter "State='Running'" -ErrorAction Stop)) {
+                $p = Normalize-KernelDriverPath -Path ([string]$drv.PathName)
+                if (-not $p) { continue }
+                if (-not (Test-Path -LiteralPath $p)) { $alerts.Add("WARNING: Running driver '$($drv.Name)' has no file on disk ($p)"); continue }
+                try {
+                    if ((Get-Item -LiteralPath $p).Length -le 40MB -and [BSMM.Forensics]::FileNeedles($p, $m, 40MB) -ne 0) { $alerts.Add("FAILURE: Driver signed with a fake-timestamp signing tool (HookSignTool) -> $p") }
+                } catch {}
+                try {
+                    $serial = [System.Security.Cryptography.X509Certificates.X509Certificate]::CreateFromSignedFile($p).GetSerialNumberString()
+                    if ($script:LeakedCertSerials -contains $serial.ToUpper()) { $alerts.Add("FAILURE: Driver signed with the leaked NVIDIA certificate ($serial) -> $p") }
+                } catch {}
+            }
+        } catch {}
+    }
+
+    # PatchGuard and other crashes in the last 30 days
+    try {
+        $bug = @(Get-WinEvent -FilterHashtable @{ LogName = 'System'; Id = 1001; StartTime = (Get-Date).AddDays(-30) } -MaxEvents 50 -ErrorAction Stop | Where-Object { $_.ProviderName -match 'WER-SystemErrorReporting|BugCheck' })
+        foreach ($e in $bug) {
+            if ([string]$e.Message -match '0x0*109\b|\(0x00000109') { $alerts.Add("FAILURE: PatchGuard crash (bugcheck 0x109) on $(Get-Date $e.TimeCreated -Format 'yyyy-MM-dd') - Windows caught the kernel being modified") }
+        }
+        if ($bug.Count -gt 0) { $alerts.Add("INFO: $($bug.Count) blue-screen crash(es) in the last 30 days") }
+    } catch {}
+
+    # Defender switched off or exclusions changed in the last 7 days
+    try {
+        foreach ($e in @(Get-WinEvent -FilterHashtable @{ LogName = 'Microsoft-Windows-Windows Defender/Operational'; Id = @(5001, 5007); StartTime = (Get-Date).AddDays(-7) } -MaxEvents 200 -ErrorAction Stop)) {
+            $when = Get-Date $e.TimeCreated -Format 'yyyy-MM-dd HH:mm'
+            if ($e.Id -eq 5001) { $alerts.Add("WARNING: Defender real-time protection was turned off on $when"); continue }
+            $msg = [string]$e.Message
+            if ($msg -match '(?i)\\Exclusions\\(Paths|Processes|Extensions)\\([^\r\n=]+?)\s*=') {
+                $what = $matches[2].Trim()
+                if ($msg -match '(?i)New value:\s*(\r?\n|$)' -or $msg -match '(?i)New value:\s*$') { $alerts.Add("WARNING: Defender exclusion removed on $when (added earlier, then cleaned up) -> $what") }
+                else { $alerts.Add("WARNING: Defender exclusion added on $when -> $what") }
+            }
+        }
+    } catch {}
+    if (-not ($alerts | Where-Object { $_ -like 'FAILURE*' -or $_ -like 'WARNING*' })) { $alerts.Insert(0, 'SUCCESS: No kernel debugger, hidden processes, rerouted signature checks or suspicious drivers') }
+    return @($alerts | Select-Object -Unique -First 30)
+}
+
+# --- Windows screen capture used by unexpected programs (colourbots / AI aimbots) ---------------------------
+$script:CaptureAllow = '(?i)\\(obs64|obs32|Medal|Discord|DiscordCanary|nvcontainer|NVIDIA Share|NVIDIA App|steamwebhelper|Steam|ShareX|SnippingTool|ScreenClippingHost|Teams|ms-teams|Zoom|chrome|msedge|firefox|opera|brave|Code|Cursor|CapCut|Lightshot|Greenshot|PowerToys[^\\]*|explorer|GameBar[^\\]*|XboxGameBar[^\\]*)\.exe$'
+function Get-ScreenCaptureAlerts {
+    param([datetime]$Since = (Get-Date).AddDays(-7))
+    $alerts = New-Object System.Collections.Generic.List[string]
+    foreach ($cap in @('graphicsCaptureProgrammatic', 'graphicsCaptureWithoutBorder')) {
+        $k = $null
+        try { $k = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey("Software\Microsoft\Windows\CurrentVersion\CapabilityAccessManager\ConsentStore\$cap\NonPackaged") } catch {}
+        if (-not $k) { continue }
+        foreach ($sub in $k.GetSubKeyNames()) {
+            $sk = $k.OpenSubKey($sub)
+            if (-not $sk) { continue }
+            $ft = $sk.GetValue('LastUsedTimeStart')
+            $sk.Close()
+            if (-not $ft) { continue }
+            $when = $null
+            try { $when = [DateTime]::FromFileTime([long]$ft) } catch { continue }
+            if ($when -lt $Since) { continue }
+            $path = $sub -replace '#', '\'
+            if ($path -match $script:CaptureAllow) { continue }
+            $kw = Get-BsmmCheatKeywordFast $path
+            if ($kw) { $alerts.Add("FAILURE: [$kw] captured the screen on $(Get-Date $when -Format 'yyyy-MM-dd HH:mm') -> $path") }
+            elseif ((Test-UntrustedUserProgramPath -Path $path) -or -not (Test-Path -LiteralPath $path)) { $alerts.Add("WARNING: Program captured the screen on $(Get-Date $when -Format 'yyyy-MM-dd HH:mm') (colourbots and AI aimbots do this) -> $path") }
+            else { $alerts.Add("INFO: Screen captured by $path on $(Get-Date $when -Format 'yyyy-MM-dd HH:mm')") }
+        }
+        $k.Close()
+    }
+    if (-not ($alerts | Where-Object { $_ -like 'FAILURE*' -or $_ -like 'WARNING*' })) { $alerts.Insert(0, 'SUCCESS: No unexpected program used Windows screen capture') }
+    return @($alerts | Select-Object -First 15)
+}
+
+# --- Input filter drivers and MAKCU-style serial input boxes ------------------------------------------------
+function Get-InputFilterAlerts {
+    $alerts = New-Object System.Collections.Generic.List[string]
+    foreach ($cls in @(@('{4D36E96F-E325-11CE-BFC1-08002BE10318}', 'mouse', 'mouclass'), @('{4D36E96B-E325-11CE-BFC1-08002BE10318}', 'keyboard', 'kbdclass'))) {
+        try {
+            $k = Open-LocalMachineRegistryKey -SubKeyPath "SYSTEM\CurrentControlSet\Control\Class\$($cls[0])"
+            if ($k) {
+                $extra = @(@($k.GetValue('UpperFilters')) | Where-Object { $_ -and $_ -ne $cls[2] })
+                $k.Close()
+                foreach ($x in $extra) {
+                    if ($x -match '^(?i)rawaccel$') { $alerts.Add("INFO: Raw Accel mouse-acceleration driver installed ($x) - legitimate, but it does change mouse input") }
+                    else { $alerts.Add("WARNING: Extra $($cls[1]) filter driver '$x' - input-injection drivers (Interception) install this way") }
+                }
+            }
+        } catch {}
+    }
+    try {
+        foreach ($d in @(Get-CimInstance Win32_PnPEntity -ErrorAction Stop | Where-Object { [string]$_.DeviceID -match 'VID_1A86&PID_55D3' })) {
+            $alerts.Add("WARNING: WCH CH343 serial device connected ('$($d.Name)') - the chip used by MAKCU input boxes")
+        }
+    } catch {}
+    if (-not ($alerts | Where-Object { $_ -like 'WARNING*' })) { $alerts.Insert(0, 'SUCCESS: No input-injection filter drivers or MAKCU-style serial devices') }
+    return @($alerts)
+}
+
+# --- Evidence logging blocked: recreated journal, disabled event channels, deny rules -----------------------
+function Get-LoggingTamperExtraAlerts {
+    $alerts = New-Object System.Collections.Generic.List[string]
+    if ((Test-Admin) -and (Initialize-BsmmForensics)) {
+        try {
+            $info = New-Object BSMM.UsnInfo
+            [void][BSMM.Forensics]::ReadUsn($env:SystemDrive, 0, [string[]]@('.x'), [string[]]@('x'), (Get-Date), '', $info)
+            if ($info.JournalId -gt 0) {
+                $created = [DateTime]::FromFileTime([long]$info.JournalId)
+                $boot = Get-BootTime
+                if ($boot -and $created -gt $boot) { $alerts.Add("FAILURE: The change journal was deleted and recreated this session ($(Get-Date $created -Format 'yyyy-MM-dd HH:mm')) - wipes file history") }
+                elseif ($created -gt (Get-Date).AddDays(-7)) { $alerts.Add("WARNING: The change journal was recreated on $(Get-Date $created -Format 'yyyy-MM-dd HH:mm') (file history before that is gone)") }
+                else { $alerts.Add("INFO: Change journal exists since $(Get-Date $created -Format 'yyyy-MM-dd')") }
+            }
+        } catch {}
+    }
+    foreach ($ch in @('Microsoft-Windows-PowerShell/Operational', 'Microsoft-Windows-CodeIntegrity/Operational', 'Microsoft-Windows-Kernel-PnP/Configuration', 'Microsoft-Windows-Windows Defender/Operational')) {
+        try {
+            $k = Open-LocalMachineRegistryKey -SubKeyPath "SOFTWARE\Microsoft\Windows\CurrentVersion\WINEVT\Channels\$ch"
+            if ($k) { $en = $k.GetValue('Enabled'); $k.Close(); if ($null -ne $en -and [int]$en -eq 0) { $alerts.Add("WARNING: Event log '$ch' is switched off") } }
+        } catch {}
+    }
+    foreach ($target in @("$env:SystemRoot\Prefetch", "$env:SystemRoot\appcompat\pca", "$env:SystemRoot\appcompat\Programs", 'HKLM:\SYSTEM\CurrentControlSet\Services\bam\State\UserSettings')) {
+        try {
+            $acl = Get-Acl -LiteralPath $target -ErrorAction Stop
+            if (@($acl.Access | Where-Object { [string]$_.AccessControlType -eq 'Deny' }).Count -gt 0) { $alerts.Add("FAILURE: A deny rule blocks Windows from recording program runs in $target") }
+        } catch {}
+    }
+    return @($alerts)
+}
+
+# --- live monitor: Roblox log lines written during the match -------------------------------------------------
+$script:RobloxLogOffsets = @{}
+function Get-BsmmRobloxLogTailAlerts {
+    $out = New-Object System.Collections.Generic.List[string]
+    $logDir = Join-Path $env:LOCALAPPDATA 'Roblox\logs'
+    $volumes = Get-BsmmVolumeMap
+    foreach ($f in @(Get-ChildItem -LiteralPath $logDir -Filter '*.log' -File -ErrorAction SilentlyContinue | Where-Object { $_.LastWriteTime -gt (Get-Date).AddMinutes(-30) -and $_.Name -match '(?i)player' })) {
+        $start = 0L
+        if ($script:RobloxLogOffsets.ContainsKey($f.FullName)) { $start = $script:RobloxLogOffsets[$f.FullName] }
+        if ($f.Length -le $start) { continue }
+        try {
+            $fs = [IO.File]::Open($f.FullName, 'Open', 'Read', 'ReadWrite')
+            [void]$fs.Seek($start, 'Begin')
+            $sr = New-Object IO.StreamReader($fs)
+            $txt = $sr.ReadToEnd()
+            $script:RobloxLogOffsets[$f.FullName] = $fs.Length
+            $sr.Close()
+        } catch { continue }
+        foreach ($m in [regex]::Matches($txt, '(?i)Blocked DLL:\s*([^\r\n]+)')) {
+            $p = ConvertTo-BsmmDrivePath -Path $m.Groups[1].Value.Trim() -Volumes $volumes
+            if (-not $p) { $p = $m.Groups[1].Value.Trim() }
+            if ($p -notmatch '(?i)^[a-z]:\\(windows|program files)') { $out.Add("FAILURE: Roblox's anti-cheat blocked a DLL during the match -> $p") }
+        }
+        if (@([regex]::Matches($txt, '(?i)HttpTraceError[^\r\n]*(127\.0\.0\.1|localhost)[^\r\n]*') | Where-Object { $_.Value -notmatch '(?i)/api/rojo|:3487[0-9]' }).Count -gt 0) { $out.Add('WARNING: Roblox tried to reach a server on this PC during the match (executor bridge?)') }
+    }
+    return $out
 }
 
 $script:ProgressWidth = 28
@@ -7397,6 +8306,7 @@ $script:SystemChecks = @(
     @{ Name = 'Clarity / Defender Integrity'; Caption = 'Checking Defender integrity';        Run = { Get-ClarityDetectionAlerts } },
     @{ Name = 'Memory Integrity (HVCI)';      Caption = 'Checking Memory Integrity';          Run = { Get-MemoryIntegrityAlerts } },
     @{ Name = 'Security Policy';              Caption = 'Checking Secure Boot and kernel protections'; Run = { Get-SecurityPolicyAlerts } },
+    @{ Name = 'Kernel Integrity';             Caption = 'Checking kernel debugger, hidden processes, signing'; Run = { Get-KernelIntegrityAlerts } },
     @{ Name = 'CLR Profiler Hijack';          Caption = 'Checking .NET profiler environment'; Run = { Get-ClrHijackAlerts } },
     @{ Name = 'Native Syscall Hooks';         Caption = 'Auditing NTDLL syscall stubs';       Run = { Get-NtdllSyscallIntegrityAlerts } },
     @{ Name = 'OBS & App Tamper';             Caption = 'Auditing browsers, streaming & apps'; Run = { Get-StreamingProcessIntegrityAlerts } },
@@ -7408,9 +8318,10 @@ $script:SystemChecks = @(
     @{ Name = 'Vulnerable Drivers';           Caption = 'Checking for vulnerable drivers';    Run = { Get-VulnerableDriverAlerts } },
     @{ Name = 'Driver Install Log';           Caption = 'Reading driver install and block log';  Run = { Get-DriverInstallAlerts } },
     @{ Name = 'Input & DMA Devices';          Caption = 'Checking input drivers and PCIe';    Run = { Get-InputAndDmaDeviceAlerts } },
+    @{ Name = 'Hypervisor & DMA';             Caption = 'Checking for hidden hypervisors and DMA cards'; Run = { Get-HypervisorDmaAlerts } },
     @{ Name = 'Macro & Auto-Clickers';        Caption = 'Checking for macro tools';           Run = { Get-MacroToolAlerts } },
-    @{ Name = 'AI Aimbot Traces';             Caption = 'Checking for AI aimbot tools';       Run = { Get-AiAimbotAlerts } },
-    @{ Name = 'Input Hardware';               Caption = 'Checking for input boxes and boards'; Run = { Get-InputHardwareAlerts } },
+    @{ Name = 'AI Aimbot Traces';             Caption = 'Checking for AI aimbot tools';       Run = { @(Get-AiAimbotAlerts; Get-ScreenCaptureAlerts) } },
+    @{ Name = 'Input Hardware';               Caption = 'Checking for input boxes and boards'; Run = { @(Get-InputHardwareAlerts; Get-InputFilterAlerts) } },
     @{ Name = 'PowerShell Module Integrity';  Caption = 'Verifying PowerShell modules';       Run = { @(Get-PowerShellHostIntegrityAlerts; Get-PowerShellModuleIntegrityAlerts) | Select-Object -Unique } },
     @{ Name = 'PowerShell Binary Integrity';  Caption = 'Verifying PowerShell binaries';      Run = { Get-PowerShellBinaryIntegrityAlerts } },
     @{ Name = 'Script Integrity';             Caption = 'Checking this check was not tampered with'; Run = { Get-ScriptIntegrityAlerts } },
@@ -7420,7 +8331,9 @@ $script:SystemChecks = @(
     @{ Name = 'Roblox Modules';               Caption = 'Checking modules loaded in Roblox';  Run = { Get-RobloxModuleAlerts } },
     @{ Name = 'Roblox Memory Integrity';      Caption = 'Checking Roblox memory integrity';   Run = { Get-RobloxMemoryIntegrityAlerts } },
     @{ Name = 'Roblox Folder Integrity';      Caption = 'Checking Roblox install folder';     Run = { Get-RobloxFolderAlerts } },
+    @{ Name = 'Roblox Tamper & Logs';         Caption = 'Reading Roblox logs and certificate settings'; Run = { Get-RobloxTamperAlerts } },
     @{ Name = 'Roblox Named Pipes';           Caption = 'Auditing named pipes';               Run = { Get-RobloxNamedPipeAlerts } },
+    @{ Name = 'Roblox Bridge & Proxy';        Caption = 'Checking Roblox for local bridges and proxies'; Run = { Get-RobloxBridgeAlerts } },
     @{ Name = 'FastFlags (ClientAppSettings)';Caption = 'Auditing FastFlags';                 Run = { Get-FastFlagsAlerts } },
     @{ Name = 'Bloxstrap / Fishstrap';        Caption = 'Checking Bloxstrap integrations';    Run = { Get-BootstrapperAlerts } },
     @{ Name = 'Anti-Bypass & Network';        Caption = 'Checking network and hosts bypass';  Run = { Get-AntiBypassNetworkAlerts } },
@@ -7429,6 +8342,9 @@ $script:SystemChecks = @(
     @{ Name = 'Cheat Files & Shortcuts';      Caption = 'Searching for cheat files and shortcuts'; Run = { Get-CheatFileAlerts } },
     @{ Name = 'Service Memory Traces';        Caption = 'Reading program traces from service memory'; Run = { Get-ServiceMemoryTraceAlerts } },
     @{ Name = 'Code Fingerprints';            Caption = 'Looking inside programs for cheat code'; Run = { Get-CodeFingerprintAlerts } },
+    @{ Name = 'Signature Forgery';            Caption = 'Checking for copied or borrowed signatures'; Run = { Get-SignatureForgeryAlerts } },
+    @{ Name = 'Injected Code';                Caption = 'Inspecting running programs for injected code'; Run = { Get-InjectedCodeAlerts } },
+    @{ Name = 'Hidden Data Streams';          Caption = 'Looking for programs hidden in data streams'; Run = { Get-HiddenStreamAlerts } },
     @{ Name = 'Download Origins';             Caption = 'Checking where downloads came from'; Run = { Get-DownloadOriginAlerts } },
     @{ Name = 'Windhawk';                     Caption = 'Checking Windhawk';                  Run = { Get-WindhawkStep1Alerts } },
     @{ Name = 'Registry Markers';             Caption = 'Checking registry markers';          Run = { Get-RegistryMarkerAlerts } },
@@ -7437,7 +8353,7 @@ $script:SystemChecks = @(
     @{ Name = 'BAM Service';                  Caption = 'Checking BAM service';               Run = { Get-BamServiceAlerts } },
 
     @{ Name = 'Prefetch Health';              Caption = 'Checking prefetch';                  Run = { Get-PrefetchHealthAlerts } },
-    @{ Name = 'Logging Tamper';               Caption = 'Checking for frozen or disabled logging'; Run = { Get-LoggingTamperAlerts } },
+    @{ Name = 'Logging Tamper';               Caption = 'Checking for frozen or disabled logging'; Run = { @(Get-LoggingTamperAlerts; Get-LoggingTamperExtraAlerts) } },
     @{ Name = 'Artifact Cross-Check';         Caption = 'Cross-checking BAM vs prefetch';     Run = { Get-ArtifactCrossCheckAlerts } },
     @{ Name = 'Program Launch Traces';        Caption = 'Reading Windows launch logs';        Run = { @(Get-PcaLaunchAlerts; Get-UserAssistAlerts; Get-RegistryTraceAlerts; Get-BamDeletedAlerts) } },
     @{ Name = 'Long-term History';            Caption = 'Reading Amcache, SRUM and Defender logs'; Run = { Get-LongTermHistoryAlerts } },

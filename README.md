@@ -56,7 +56,38 @@ The PC check also uses evidence that renaming or deleting a cheat does not remov
   and KMBox/MAKCU-style input boxes
 - **Kernel protection**: Secure Boot, Vulnerable Driver Blocklist and Memory Integrity
 
-A full PC check takes about 2 to 3 minutes.
+And it checks for the tricks used to get past screenshare tools:
+
+- **Borrowed or fake signatures**: signatures copied onto modified files, fake "Roblox"/"Microsoft"
+  signers, self-made root certificates, stolen or leaked publisher certificates (including the 2022
+  NVIDIA leak), Roblox-signed programs used to side-load a cheat DLL, and rerouted Windows signature
+  checking
+- **Code hidden inside other programs**: hollowed processes, program images loaded without a file,
+  threads running code that belongs to no file, unsigned DLLs inside signed programs
+- **Roblox bridges and proxies**: Roblox connected to a local program (how executors like Xeno talk
+  to Roblox), the Fleasion proxy, Roblox certificate pinning switched off, and DLLs Roblox's own
+  anti-cheat blocked (from Roblox's logs)
+- **Kernel tells**: kernel debugger, processes hidden from the process list, test-signing reported by
+  the kernel, PatchGuard crashes, drivers signed with fake-timestamp tools, AMSI/ETW patching
+- **Hardware and capture**: hidden hypervisors, broken or driverless PCIe devices (DMA cards),
+  programs that used Windows screen capture, input filter drivers and MAKCU-style serial devices
+- **Hidden files and wiped evidence**: programs hidden in NTFS data streams, a recreated change
+  journal, disabled event logs and deny rules that stop Windows recording program runs
+
+A full PC check takes about 3 to 4 minutes.
+
+### Live monitor
+
+The live monitor first runs a deep scan of the PC as it is (about a minute), then during the match
+watches for:
+
+- programs started mid-match, checked for cheat code, copied signatures and USB/network origins
+- Roblox launched from a fake or unsigned file, or with DLLs planted next to it
+- Roblox connecting to a local program or proxy, and DLLs Roblox's anti-cheat blocks
+- injected code in new programs, kernel debugger and hidden processes
+- frozen or stopped logging services, new PCIe devices, input boards and boxes
+- deleted or renamed programs, new executor folders, driver drops and Prefetch wipes
+- programs using screen capture, plus everything the original monitor already tracked
 
 ## What is sent to BSMM staff
 
@@ -76,8 +107,10 @@ Everything that is sent is also shown on your screen.
 
 The checks only read. The script itself:
 
-- reads the memory of a few Windows services and of unsigned programs to look for cheat traces
-  (never Roblox's memory)
+- reads the memory of a few Windows services and of running programs to look for cheat traces
+  and injected code (never Roblox's memory)
+- lists the PC's local network connections to see whether Roblox talks to a program on the same PC
+  (nothing about your network is sent)
 - makes a temporary Windows shadow copy with Microsoft's `esentutl` to read the locked Amcache and
   SRUM history files, and deletes its copies straight after
 - downloads Process Explorer from Microsoft (`download.sysinternals.com`), checks Microsoft's
