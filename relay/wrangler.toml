@@ -1,0 +1,17 @@
+# Only needed if you deploy from the command line with `npx wrangler deploy`.
+# Deploying from the Cloudflare dashboard (see SETUP.md) does not use this file.
+name = "bsmm-relay"
+main = "worker.js"
+compatibility_date = "2025-01-01"
+
+# Global rate limit: 20 requests per IP per minute across all Cloudflare locations.
+[[ratelimits]]
+name = "REPORT_LIMITER"
+namespace_id = "1001"
+
+  [ratelimits.simple]
+  limit = 20
+  period = 60
+
+# The webhook is a secret, never put it in this file. Set it with:
+#   npx wrangler secret put WEBHOOK_URL
