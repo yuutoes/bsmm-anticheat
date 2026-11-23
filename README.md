@@ -12,22 +12,14 @@ There are two scripts:
 
 ## How to run
 
-Open **PowerShell as administrator** (right-click > Run as administrator).
+Staff start a check with `/pccheck` in Discord and give you a **one-time command**. It works once,
+for 10 minutes, and only for you.
 
-**PC check**, when staff ask for one:
+Open **PowerShell as administrator** (right-click > Run as administrator), paste the whole line and
+press Enter. For a live monitor, do the same in its own admin window and leave it open for the match.
 
-```powershell
-iex (iwr "https://raw.githubusercontent.com/yuutoes/bsmm-anticheat/main/BSMM-Check.ps1" -UseBasicParsing).Content
-```
-
-**Live monitor**, if staff ask you to run it during a match (in its own admin window):
-
-```powershell
-iex (iwr "https://raw.githubusercontent.com/yuutoes/bsmm-anticheat/main/BSMM-Monitor.ps1" -UseBasicParsing).Content
-```
-
-Both ask for your Roblox username and show a **report ID** on screen. Keep the window visible to
-staff (screen share or recording) until they have seen the result.
+The scripts cannot be started from this page: without a command from staff they stop straight away.
+The window shows a **report ID**. Results go to staff and are not listed on your screen.
 
 ## What it checks
 
@@ -73,6 +65,10 @@ And it checks for the tricks used to get past screenshare tools:
   programs that used Windows screen capture, input filter drivers and MAKCU-style serial devices
 - **Hidden files and wiped evidence**: programs hidden in NTFS data streams, a recreated change
   journal, disabled event logs and deny rules that stop Windows recording program runs
+- **Cheat menus after they are closed**: the `imgui.ini` settings file most cheat menus leave
+  behind, and its creation or deletion in the change journal
+- **Roblox accounts**: the accounts used on the PC and the games last joined, and Roblox logs or
+  saved accounts that were wiped although Roblox was used recently
 
 A full PC check takes about 3 to 4 minutes.
 
@@ -87,21 +83,26 @@ watches for:
 - injected code in new programs, kernel debugger and hidden processes
 - frozen or stopped logging services, new PCIe devices, input boards and boxes
 - deleted or renamed programs, new executor folders, driver drops and Prefetch wipes
-- programs using screen capture, plus everything the original monitor already tracked
+- programs using screen capture, new cheat menu settings files, plus everything the original
+  monitor already tracked
 
 ## What is sent to BSMM staff
 
-Reports go to the BSMM relay (`relay/worker.js`, a Cloudflare Worker), which posts them to a staff
-Discord channel.
+Reports go to the BSMM relay (`relay/worker.js`, a Cloudflare Worker). It only accepts a report
+for a check staff started, works out the verdict itself, posts a summary to a staff Discord channel
+and keeps the full report for staff for 90 days.
 
-**Sent:** the report ID, the Roblox username you type in, a trust score, the result of each check,
-the details of checks that failed or need review, your Windows build, Roblox version, PC uptime and
-whether the script ran as admin. During the match: the alerts the live monitor raises.
+**Sent:** the report ID, the result of each check with the details of anything that failed or
+needs review, your Windows build, Roblox version, PC uptime and whether the script ran as admin.
+The Roblox user IDs of the accounts used on this PC and the games they last joined (IDs and times
+from Roblox's own logs and account list). When programs were run on this PC (path, time and whether
+the file is signed), so staff can compare it with your match times. A one-way hash of hardware
+serial numbers, used to recognise the same PC again; the serial numbers themselves are not sent.
+During a match: the alerts the live monitor raises.
 
 **Never sent:** your Windows user name or PC name (removed from every path before sending), file
-contents, passwords or tokens, browsing history, the list of programs you ran, or USB device names.
-
-Everything that is sent is also shown on your screen.
+contents, passwords, Roblox cookies or login tokens (the script never opens them), browsing history
+or USB device names.
 
 ## Does it change anything on my PC?
 
@@ -115,7 +116,6 @@ The checks only read. The script itself:
   SRUM history files, and deletes its copies straight after
 - downloads Process Explorer from Microsoft (`download.sysinternals.com`), checks Microsoft's
   signature, and deletes it again when you close it
-- writes its own log to `C:\ProgramData\bsmm_security_events.log`
 - changes the colours and title of its own PowerShell window
 
 ## For BSMM staff
@@ -129,9 +129,12 @@ The checks only read. The script itself:
 - League policy switches are at the top of `BSMM-Check.ps1` (`RequireSecureBoot`,
   `RequireDriverBlocklist`, `RequireMemoryIntegrity`): turn them on to make those settings a FAIL
   instead of a warning.
-- Every report includes a **code fingerprint**. It is the same for every unmodified copy of a
-  version, so a different value means the player ran an edited script.
-- `relay/` holds the relay that keeps the Discord webhook secret. Setup steps: `relay/SETUP.md`.
-- Shared settings (brand, colours, relay address, trust score weights, cheat names) are at the top
-  of **both** scripts. Change them in both.
-- Always match the report ID in Discord with the one on the player's recording.
+- The relay hands out the script itself and knows which version it gave and which checks that
+  version runs, so a report that leaves checks out, finishes too fast or names another version is
+  marked as untrusted.
+- Checks are started with `/pccheck` (admins and the security role). Each command is tied to one
+  player, works once and expires after 10 minutes.
+- `relay/` holds the relay. It keeps the Discord webhook and issues the API keys. Setup steps: `relay/SETUP.md`.
+- Shared settings (brand, colours, cheat names, league policy) are at the top of **both** scripts.
+  Change them in both. The trust score is worked out by the relay (`WEIGHTS` in `relay/worker.js`).
+- Players do not see results, so a report ID read out by the player only tells you which report is theirs.

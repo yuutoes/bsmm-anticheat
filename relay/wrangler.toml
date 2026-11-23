@@ -1,6 +1,6 @@
 # Only needed if you deploy from the command line with `npx wrangler deploy`.
 # Deploying from the Cloudflare dashboard (see SETUP.md) does not use this file.
-name = "bsmm-relay"
+name = "bsmm-relay-v2"
 main = "worker.js"
 compatibility_date = "2025-01-01"
 
@@ -13,5 +13,12 @@ namespace_id = "1001"
   limit = 20
   period = 60
 
-# The webhook is a secret, never put it in this file. Set it with:
-#   npx wrangler secret put WEBHOOK_URL
+# Checks, reports and API keys (hashed). Create it with `npx wrangler d1 create bsmm-relay`
+# and paste the id it prints here.
+[[d1_databases]]
+binding = "DB"
+database_name = "bsmm-relay"
+database_id = "64ba7397-cdcf-4804-a452-7f25b614b083"
+
+# The admin secret is a secret, never put it in this file. Set it with:
+#   npx wrangler secret put ADMIN_SECRET

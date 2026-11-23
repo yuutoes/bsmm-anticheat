@@ -36,7 +36,7 @@ $script:Brand = @{
     Name    = 'BSMM'
     Product = 'Anti-Cheat'
     Mode    = 'PC check'
-    Version = '1.2.0'
+    Version = '1.3.0'
     Website = ''                     # optional, e.g. 'discord.gg/yourserver' - shown beside the logo
 }
 
@@ -55,15 +55,13 @@ $script:Palette = @{
     Ink    = @{ Hex = '#0E0E14'; Fallback = 'Black' }         # text drawn on coloured badges
 }
 
-# --- Discord report ----------------------------------------------------------
-# Reports go to your BSMM relay (relay/worker.js on Cloudflare), which forwards them to Discord.
-# The Discord webhook is stored only on the relay, so this script is safe to publish.
+# --- Report ------------------------------------------------------------------
+# Results are never shown on this PC. They go to the BSMM relay (relay/worker.js on Cloudflare),
+# which scores them and posts to Discord. The relay address and the one-time signing key come
+# from the session the relay puts in front of this script, so nothing here needs editing.
 # User names, the PC name and URL tokens are stripped before anything is sent.
 $script:Report = @{
-    RelayUrl          = 'https://bsmm-relay.yourgaydad2020.workers.dev'    # your BSMM relay (Cloudflare Worker)
-    AskPlayerName     = $true    # ask for the player's Roblox username at the start (shown on screen and in the report)
-    LiveUpdateSeconds = 120      # how often the live-monitor message is refreshed (keep >= 60 for Discord rate limits)
-    AttachFullLog     = $true    # attach the full anonymised log as a .txt file
+    LiveUpdateSeconds = 120      # how often the live monitor reports in (keep >= 60 for Discord rate limits)
 }
 
 # --- League policy -----------------------------------------------------------
@@ -75,17 +73,26 @@ $script:Policy = @{
     DeepHistory            = $true    # read Amcache + SRUM through a temporary shadow copy (~30 days of history, adds ~10-30 s)
 }
 
-# --- Trust score (starts at 100, these are subtracted) ------------------------
-$script:TrustWeights = @{
-    FailSection = 18; FailCap = 60     # per check that FAILED, up to the cap
-    WarnSection = 4;  WarnCap = 28     # per check with warnings, up to the cap
-    NotAdmin    = 10                   # checks could not run fully
-    LiveFail    = 10; LiveWarn = 3; LiveCap = 40   # alerts raised during the live monitor
+# --- Session -----------------------------------------------------------------
+# This script only runs from the one-time command BSMM staff hand out. The relay serves the script
+# with the session in front of it: the check ID, a signing key that works once, and its own address.
+$script:Session = $null
+try { $script:Session = $global:BsmmSession } catch {}
+Microsoft.PowerShell.Utility\Remove-Variable -Name BsmmSession -Scope Global -Force -ErrorAction SilentlyContinue
+if (-not ($script:Session -is [hashtable]) -or
+    [string]$script:Session.Id -cnotmatch '^BSMM-[2-9A-HJ-NP-Z]{8}$' -or
+    [string]$script:Session.Key -cnotmatch '^[0-9a-f]{64}$' -or
+    [string]$script:Session.Relay -notmatch '^(https://[A-Za-z0-9.-]+(:\d+)?|http://(127\.0\.0\.1|localhost)(:\d+)?)$' -or
+    [string]$script:Session.Mode -ne 'check') {
+    Microsoft.PowerShell.Utility\Write-Host ''
+    Microsoft.PowerShell.Utility\Write-Host '  This check only runs from the one-time command BSMM staff give you.' -ForegroundColor Yellow
+    Microsoft.PowerShell.Utility\Write-Host '  Ask staff for a new command and paste the whole line into PowerShell.' -ForegroundColor Yellow
+    Microsoft.PowerShell.Utility\Write-Host ''
+    return
 }
 
 $script:BsmmVersion = $script:Brand.Version
-$script:ReportId = 'BSMM-' + (([guid]::NewGuid().ToString('N') + [guid]::NewGuid().ToString('N')).ToUpper() -replace '[01]', '').Substring(0, 8)
-$script:PlayerName = ''
+$script:ReportId = [string]$script:Session.Id
 $script:MonitorLog = New-Object System.Collections.Generic.List[string]
 
 # =============================================================================
@@ -203,11 +210,6 @@ public static extern bool SetConsoleMode(IntPtr hConsoleHandle, uint dwMode);
         $Host.UI.RawUI.ForegroundColor = 'Gray'
     } catch {}
     try { $Host.UI.RawUI.WindowTitle = "$($script:Brand.Name) $($script:Brand.Product) v$($script:Brand.Version) - $($script:Brand.Mode)" } catch {}
-}
-
-function Invoke-ConsoleRefresh {
-    try { [Console]::Out.Flush() } catch {}
-    try { [Console]::Error.Flush() } catch {}
 }
 
 # Real locations of Desktop / Downloads / Documents. With OneDrive backup (the Windows 11 default)
@@ -469,12 +471,7 @@ function Show-SessionMeta {
     Out-Seg '     ADMIN ' -Fg 'Muted' -NoNewline
     if ($admin) { Out-Seg 'YES' -Fg 'Pass' -Bold } else { Out-Seg 'NO' -Fg 'Fail' -Bold }
     Out-Seg '  REPORT ' -Fg 'Muted' -NoNewline
-    Out-Seg $script:ReportId -Fg 'Brand2' -Bold -NoNewline
-    if ($script:PlayerName) {
-        Out-Seg '     PLAYER ' -Fg 'Muted' -NoNewline
-        Out-Seg $script:PlayerName -Fg 'Text' -Bold -NoNewline
-    }
-    Out-Seg ''
+    Out-Seg $script:ReportId -Fg 'Brand2' -Bold
 }
 
 function Write-StepHeader {
@@ -1979,8 +1976,7 @@ $script:TamperLogFailureWarned = @{}
 
 function Get-TamperLogEvents {
     param(
-        [datetime]$Since,
-        [string]$LogFile
+        [datetime]$Since
     )
 
     $events = @()
@@ -1998,7 +1994,7 @@ function Get-TamperLogEvents {
                 $warnKey = "winevent|$($filter.LogName)"
                 if (-not $script:TamperLogFailureWarned.ContainsKey($warnKey)) {
                     $script:TamperLogFailureWarned[$warnKey] = $true
-                    Write-MonitorAlert -Message "WARNING: Could not query '$($filter.LogName)' log for tamper events ($($_.Exception.Message))" -LogFile $LogFile -Color Yellow
+                    Write-MonitorAlert -Message "WARNING: Could not query '$($filter.LogName)' log for tamper events ($($_.Exception.Message))" -Color Yellow
                 }
             }
         }
@@ -2020,25 +2016,19 @@ function Clear-MonitorStatusLine {
     $script:MonitorStatusShown = $false
 }
 
-# "  * LIVE  00:12:33    0 FAIL   1 WARN   3 INFO    Ctrl+C to stop"  (the dot blinks like a REC light)
+# "  * LIVE  00:12:33    Ctrl+C when the match is over"  (the dot blinks like a REC light)
+# Only the running time is shown: what the monitor has noticed goes to staff, not to this screen.
 function Write-MonitorStatusLine {
     param([datetime]$Since)
     $elapsed = (Get-Date) - $Since
     $script:MonitorPulse = -not $script:MonitorPulse
     $dotTok = 'Line'; if ($script:MonitorPulse) { $dotTok = 'Fail' }
-    $c = $script:MonitorAlertCounts
     $parts = @(
         @("`r  ", 'Body', $false),
         @($script:G.Dot, $dotTok, $false),
         @(' LIVE  ', 'Text', $true),
         @(('{0:hh\:mm\:ss}' -f $elapsed), 'Body', $false),
-        @('    ', 'Body', $false),
-        @("$($c.FAIL) FAIL", $(if ($c.FAIL -gt 0) { 'Fail' } else { 'Muted' }), ($c.FAIL -gt 0)),
-        @('   ', 'Body', $false),
-        @("$($c.WARN) WARN", $(if ($c.WARN -gt 0) { 'Warn' } else { 'Muted' }), $false),
-        @('   ', 'Body', $false),
-        @("$($c.INFO) INFO", 'Muted', $false),
-        @('    Ctrl+C to stop', 'Line', $false)
+        @('    Ctrl+C when the match is over', 'Line', $false)
     )
     if ($script:UseAnsi) {
         $sb = New-Object System.Text.StringBuilder
@@ -2053,10 +2043,11 @@ function Write-MonitorStatusLine {
     $script:MonitorStatusShown = $true
 }
 
+# Records one live-monitor event for the next report to staff. Nothing is printed and nothing is
+# written to disk, so the player cannot see what was noticed.
 function Write-MonitorAlert {
     param(
         [string]$Message,
-        [string]$LogFile,
         [string]$Color = '',
         [ValidateSet('', 'FAIL', 'WARN', 'INFO', 'NOTE')]
         [string]$Level = ''
@@ -2074,21 +2065,10 @@ function Write-MonitorAlert {
             }
         }
     }
-    if (-not $Level) { $Level = if ($Color -eq 'Yellow') { 'WARN' } else { 'NOTE' } }
-    if ($script:MonitorAlertCounts.ContainsKey($Level)) { $script:MonitorAlertCounts[$Level]++ }
+    if (-not $Level) { $Level = if ($Color -eq 'Yellow') { 'WARN' } else { 'INFO' } }
+    if ($Level -eq 'NOTE') { $Level = 'INFO' }
+    $script:MonitorAlertCounts[$Level]++
     if ($null -ne $script:MonitorLog) { [void]$script:MonitorLog.Add("[$(Get-Date -Format 'HH:mm:ss')] [$Level] $text") }
-
-    $timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
-    Clear-MonitorStatusLine
-    $textTok = switch ($Level) { 'FAIL' { 'Text' } 'INFO' { 'Muted' } default { 'Body' } }
-    Out-TaggedText -Indent '  ' -Time (Get-Date -Format 'HH:mm:ss') -Tag $Level -Text $text -TextToken $textTok
-    Invoke-ConsoleRefresh
-    try {
-        Add-Content -LiteralPath $LogFile -Value "[$timestamp] [$Level] $text" -ErrorAction Stop
-    } catch {
-        $fallback = Join-Path $env:TEMP 'bsmm_security_events.log'
-        try { Add-Content -LiteralPath $fallback -Value "[$timestamp] [$Level] $text" -ErrorAction SilentlyContinue } catch {}
-    }
 }
 
 $script:MonitorSeenKeys = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
@@ -2116,13 +2096,12 @@ function Write-MonitorAlertOnce {
     param(
         [string]$Category,
         [string]$Message,
-        [string]$LogFile,
         [string]$Level = '',
         [string]$Color = ''
     )
     $key = Get-AlertDedupKey -Category $Category -Message $Message
     if (-not $script:MonitorSeenKeys.Add($key)) { return }
-    $p = @{ Message = $Message; LogFile = $LogFile }
+    $p = @{ Message = $Message }
     if ($Level) { $p.Level = $Level }
     if ($Color) { $p.Color = $Color }
     Write-MonitorAlert @p
@@ -2278,8 +2257,14 @@ $script:CheatKeywords = @(
 
 $script:FolderOnlyKeywords = @('map')
 
-# Common words that only count as a whole word (so 'tModLoader' or 'WebView2Loader' do not match 'loader').
-$script:TokenOnlyKeywords = @('loader', 'wave', 'swift', 'hydrogen', 'zenith', 'velocity', 'oxygen', 'cryptic', 'celery', 'nihon', 'trigon', 'aegis', 'injector', 'executor', 'bunni')
+# Common words that only count as a whole word (so 'tModLoader' or 'WebView2Loader' do not match 'loader',
+# and 'Halo: Campaign Evolved' does not match 'evolve').
+$script:TokenOnlyKeywords = @('loader', 'wave', 'swift', 'hydrogen', 'zenith', 'velocity', 'oxygen', 'cryptic', 'celery', 'nihon', 'trigon', 'aegis', 'injector', 'executor', 'bunni',
+    'photon', 'evolve', 'matrix', 'clarity', 'spectre', 'severe', 'lumen', 'monolith', 'lattice', 'atlanta')
+
+# Well-known names that contain a cheat keyword but are something else. They are cut out of the text
+# before it is matched, so a real cheat name elsewhere in the same path still counts.
+$script:KeywordBenignPattern = '(?i)\\(SystemApps|WindowsApps|Packages)\\MicrosoftWindows\.Client\.Photon.*|Photon ?(Engine|Unity|Voice|Server|Realtime)[^\\]*|SpectreClient[^\\]*|voiceclarity[^\\]*|Microsoft\.?Clarity[^\\]*|Matrix ?Awakens[^\\]*'
 
 function Test-KeywordTokenMatch {
     param(
@@ -2337,6 +2322,8 @@ function Get-MatchedCheatKeyword {
     if ([string]::IsNullOrWhiteSpace($Text)) { return $null }
     # one compiled regex rules out almost every name before the slower per-keyword loop
     if (-not (Get-BsmmKeywordRegex).IsMatch($Text) -and -not ($FolderName -and $Text -match '(?i)(^|[\\_\s\-\.])map($|[\\_\s\-\.])')) { return $null }
+    $Text = [regex]::Replace($Text, $script:KeywordBenignPattern, '_')
+    if ([string]::IsNullOrWhiteSpace($Text)) { return $null }
     $lower = $Text.ToLower()
 
     if ($FolderName) {
@@ -2926,8 +2913,7 @@ function Update-ProcessChangeMonitor {
     param(
         [hashtable]$Previous,
         [hashtable]$Current,
-        [hashtable]$Watched,
-        [string]$LogFile
+        [hashtable]$Watched
     )
 
     foreach ($procId in $Current.Keys) {
@@ -2944,7 +2930,7 @@ function Update-ProcessChangeMonitor {
         if ($isNotepad -or $isBat -or $isVbs) {
             $toolTag = if ($isNotepad) { 'Notepad' } elseif ($isBat) { 'Batch (.bat)' } else { 'VBScript (.vbs)' }
             $argInfo = if ($cmd) { " [$cmd]" } else { "" }
-            Write-MonitorAlert -Message "Script/Editor Launched ($toolTag): $name (PID $procId)$argInfo" -LogFile $LogFile -Level WARN
+            Write-MonitorAlert -Message "Script/Editor Launched ($toolTag): $name (PID $procId)$argInfo" -Level WARN
             $Watched[$procId] = $proc
             continue
         }
@@ -2957,9 +2943,9 @@ function Update-ProcessChangeMonitor {
         $tags = @($proc.Reasons | Where-Object { $_ -ne 'no image path' })
         if ($tags.Count -gt 0) {
             $level = if ($tags -match 'masquerade' -or ($tags | Where-Object { $_ -ne 'name/path mismatch' }).Count -gt 0) { 'FAIL' } else { 'WARN' }
-            Write-MonitorAlert -Message "Started [$($tags -join ', ')]: $label" -LogFile $LogFile -Level $level
+            Write-MonitorAlert -Message "Started [$($tags -join ', ')]: $label" -Level $level
         } else {
-            Write-MonitorAlert -Message "Started [userland]: $label" -LogFile $LogFile -Level WARN
+            Write-MonitorAlert -Message "Started [userland]: $label" -Level WARN
         }
         $Watched[$procId] = $proc
     }
@@ -2974,9 +2960,9 @@ function Update-ProcessChangeMonitor {
 
         $tags = @($proc.Reasons | Where-Object { $_ -ne 'no image path' })
         if ($tags.Count -gt 0) {
-            Write-MonitorAlert -Message "Exited [$($tags -join ', ')]: $label" -LogFile $LogFile -Level INFO
+            Write-MonitorAlert -Message "Exited [$($tags -join ', ')]: $label" -Level INFO
         } else {
-            Write-MonitorAlert -Message "Exited [userland]: $label" -LogFile $LogFile -Level INFO
+            Write-MonitorAlert -Message "Exited [userland]: $label" -Level INFO
         }
         $Watched.Remove($procId) | Out-Null
     }
@@ -3697,7 +3683,9 @@ function Get-PrefetchHealthAlerts {
     } else {
         $count = 0
         try { $count = @(Get-ChildItem -LiteralPath $prefetchPath -Filter '*.pf' -ErrorAction Stop).Count } catch {}
-        if ($count -eq 0) {
+        if ($count -eq 0 -and -not (Test-Admin)) {
+            $alerts += 'WARNING: Could not read the Prefetch folder (run as Administrator)'
+        } elseif ($count -eq 0) {
             $alerts += 'FAILURE: Prefetch folder is empty (execution history wiped or prefetch disabled)'
         } elseif ($count -lt 20) {
             $alerts += "WARNING: Only $count prefetch files present (recently cleaned?)"
@@ -3753,7 +3741,8 @@ function Get-BamServiceAlerts {
         if ([int]$start -eq 4) { $alerts += 'FAILURE: BAM driver Start=4 (disabled in registry)' }
     } catch {}
     $entryCount = @(Get-BamEntries).Count
-    if ($entryCount -eq 0) { $alerts += 'FAILURE: BAM execution history is empty' }
+    if ($entryCount -eq 0 -and -not (Test-Admin)) { $alerts += 'WARNING: Could not read BAM execution history (run as Administrator)' }
+    elseif ($entryCount -eq 0) { $alerts += 'FAILURE: BAM execution history is empty' }
     else { $alerts += "INFO: $entryCount BAM/DAM entries" }
 
     if (-not ($alerts | Where-Object { $_ -like 'FAILURE*' -or $_ -like 'WARNING*' })) {
@@ -3943,7 +3932,10 @@ function Get-VulnerableDriverAlerts {
         $tier = $script:VulnerableDriverTiers[$leaf]
         if ($tier -eq 'SKIP') { continue }
         if ($drv.State -eq 'Running') {
-            $alerts += "${tier}: Known-vulnerable driver LOADED: $($drv.Name) -> $path"
+            # Hardware vendor tools install these drivers properly; a cheat loader drops its copy somewhere else.
+            $note = ''
+            if ($tier -eq 'FAILURE' -and $path -match '(?i)^[A-Z]:\\(Program Files( \(x86\))?\\|Windows\\System32\\drivers\\)') { $tier = 'WARNING'; $note = ' (installed location, usually a hardware vendor tool)' }
+            $alerts += "${tier}: Known-vulnerable driver LOADED${note}: $($drv.Name) -> $path"
         } else {
             $alerts += "INFO: Known-vulnerable driver installed but not running: $($drv.Name) -> $path"
         }
@@ -4024,16 +4016,24 @@ function Get-InputAndDmaDeviceAlerts {
 
 $script:WellKnownCaPattern = '(?i)DigiCert|GlobalSign|Sectigo|COMODO|USERTrust|AAA Certificate|Entrust|Go ?Daddy|Starfield|Baltimore|VeriSign|Thawte|GeoTrust|Symantec|ISRG|Let.s Encrypt|Amazon|Google Trust|GTS Root|Apple|Certum|QuoVadis|IdenTrust|DST Root|SwissSign|T-TeleSec|Actalis|Buypass|D-TRUST|SSL\.com|Cybertrust|Network Solutions|Trustwave|SecureTrust|Secure Global|AffirmTrust|XRamp|Certigna|CFCA|TWCA|Hongkong Post|e-Szigno|NetLock|OISTE|WISeKey|Security Communication|Staat der Nederlanden|Izenpe|emSign|GDCA|Chambers|TrustCor|Hellenic|Atos|ANF|Camerfirma|HARICA|Telia|Sonera|Microsec|E-Tugra|TunTrust|vTrus|BJCA|Kaspersky|ESET|Avast|AVG|Bitdefender|Norton|McAfee|Fortinet|Sophos|Zscaler|Cisco|Palo Alto|Trend Micro|Malwarebytes|Adobe|Mozilla|VMware|Oracle|Intel|NVIDIA|AMD|Dell|Hewlett|HP Inc|Lenovo|ASUS|Acer|Samsung|Valve|Epic Games|Discord|Roblox|Logitech|Razer|Corsair|Steelseries|NordVPN'
 
+# Microsoft's own pre-release roots (Development Root CA 2014, Testing Root CA 2010). Windows Insider
+# builds ship them, so they are not forgeries. Matched by thumbprint: a name alone proves nothing.
+$script:MicrosoftPreReleaseRoots = @('F8DB7E1C16F1FFD4AAAD4AAD8DFF0F2445184AEB', '8A334AA8052DD244A647306A76B8178FA215F344')
+
 function Get-RootCertificateAlerts {
     $alerts = @()
+    # The machine store goes first: Windows shows every machine root in the user store too, so a
+    # certificate only counts as "user store" when it is not in the machine store.
     $stores = @(
-        @{ Path = 'Cert:\CurrentUser\Root';  Label = 'user' },
-        @{ Path = 'Cert:\LocalMachine\Root'; Label = 'machine' }
+        @{ Path = 'Cert:\LocalMachine\Root'; Label = 'machine' },
+        @{ Path = 'Cert:\CurrentUser\Root';  Label = 'user' }
     )
+    $seen = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
     foreach ($store in $stores) {
         $certs = @()
         try { $certs = @(Get-ChildItem -Path $store.Path -ErrorAction Stop) } catch { continue }
         foreach ($cert in $certs) {
+            if (-not $seen.Add([string]$cert.Thumbprint)) { continue }
             if (-not (Test-UserInstalledRootThumbprint -Thumbprint $cert.Thumbprint)) { continue }
             $subject = [string]$cert.Subject
             $short = $subject
@@ -4041,7 +4041,9 @@ function Get-RootCertificateAlerts {
             $when = Get-Date $cert.NotBefore -Format 'yyyy-MM-dd'
             $desc = "'$short' ($($store.Label) store, issued $when, $($cert.Thumbprint.Substring(0,8))...)"
 
-            if ($subject -match '(?i)microsoft') {
+            if ($script:MicrosoftPreReleaseRoots -contains $cert.Thumbprint) {
+                $alerts += "INFO: Microsoft pre-release root certificate, normal on Windows Insider builds $desc"
+            } elseif ($subject -match '(?i)microsoft') {
                 $alerts += "FAILURE: Forged Microsoft root certificate $desc"
             } elseif ($store.Label -eq 'user') {
                 $alerts += "WARNING: Root certificate installed in user store $desc"
@@ -4691,39 +4693,6 @@ function Test-AlertSetPassed {
 }
 
 function Write-Rule { Out-Rule }
-
-function Write-TaggedLine {
-    param([string]$Line, [string]$Indent = '  ')
-
-    $tag = 'NOTE'; $text = $Line
-    if ($Line -match '(?s)^(SUCCESS|FAILURE|WARNING|INFO):\s*(.*)$') {
-        $text = $matches[2]
-        switch ($matches[1]) {
-            'SUCCESS' { $tag = 'PASS' }
-            'FAILURE' { $tag = 'FAIL' }
-            'WARNING' { $tag = 'WARN' }
-            'INFO'    { $tag = 'INFO' }
-        }
-    }
-    $textTok = switch ($tag) { 'FAIL' { 'Text' } 'INFO' { 'Muted' } default { 'Body' } }
-    Out-TaggedText -Indent $Indent -Tag $tag -Text $text -TextToken $textTok
-}
-
-# "  | Kernel Drivers                                   FAIL "  followed by its findings
-function Write-Section {
-    param($Title, $Lines)
-
-    $summary = Get-AlertSetSummary -Lines @($Lines)
-    $tok = Get-StatusToken $summary.Status
-    $pad = [Math]::Max(1, $script:UiWidth - 8 - ([string]$Title).Length)
-    Out-Seg ''
-    Out-Seg '  ' -NoNewline
-    Out-Seg $script:G.Bar -Fg $tok -NoNewline
-    Out-Seg (' ' + $Title) -Fg 'Text' -Bold -NoNewline
-    Out-Seg (' ' * $pad) -NoNewline
-    Out-Badge $summary.Status
-    foreach ($line in @($Lines)) { Write-TaggedLine -Line $line -Indent '    ' }
-}
 
 # =============================================================================
 #   BSMM additional checks
@@ -5710,28 +5679,9 @@ function Get-BamDeletedAlerts {
 }
 
 # =============================================================================
-#   Trust score and Discord report
+#   Report to staff: what is collected and how it is sent
+#   The verdict and trust score are worked out by the relay, never on this PC.
 # =============================================================================
-
-function Get-BsmmTrustScore {
-    param([array]$Results, [int]$LiveFail = 0, [int]$LiveWarn = 0)
-    $w = $script:TrustWeights
-    $fail = @($Results | Where-Object { $_.Summary.Status -eq 'FAIL' }).Count
-    $warn = @($Results | Where-Object { $_.Summary.Status -eq 'WARN' }).Count
-    $score = 100
-    $score -= [Math]::Min($w.FailCap, $fail * $w.FailSection)
-    $score -= [Math]::Min($w.WarnCap, $warn * $w.WarnSection)
-    $admin = $false; try { $admin = Test-Admin } catch {}
-    if (-not $admin) { $score -= $w.NotAdmin }
-    $score -= [Math]::Min($w.LiveCap, ($LiveFail * $w.LiveFail) + ($LiveWarn * $w.LiveWarn))
-    $score = [int][Math]::Max(0, [Math]::Min(100, $score))
-
-    $label = 'TRUSTED'; $token = 'Pass'; $color = 0x34D399
-    if ($score -lt 40)     { $label = 'HIGH RISK';  $token = 'Fail'; $color = 0xFB4D6D }
-    elseif ($score -lt 70) { $label = 'SUSPICIOUS'; $token = 'Fail'; $color = 0xF97316 }
-    elseif ($score -lt 90) { $label = 'REVIEW';     $token = 'Warn'; $color = 0xFBBF24 }
-    return @{ Score = $score; Label = $label; Token = $token; Color = $color; Fail = $fail; Warn = $warn; Admin = $admin }
-}
 
 # Removes personal details before anything leaves the PC.
 function Protect-BsmmText {
@@ -5747,8 +5697,8 @@ function Protect-BsmmText {
     return $t.Replace('`', "'")
 }
 
-# Lines left out of the Discord report because they describe the player's personal activity
-# rather than anything suspicious (the full list of apps they ran, USB device names, archive names).
+# Lines left out of the report because they describe the player's personal activity rather than
+# anything suspicious (the full list of apps they ran, USB device names, archive names).
 function Test-BsmmReportLine {
     param([string]$Section, [string]$Line)
     if ($Section -eq 'Session' -and $Line -match '^INFO: (Ran |\.\.\. and)') { return $false }
@@ -5763,6 +5713,503 @@ function Limit-BsmmText {
     return $Text.Substring(0, [Math]::Max(0, $Max - 3)) + '...'
 }
 
+# Seconds since 1970 (UTC), the form every time in the report is sent in.
+function Get-BsmmUnix {
+    param([datetime]$Time = (Get-Date))
+    return [int64][Math]::Floor(($Time.ToUniversalTime() - [datetime]'1970-01-01').TotalSeconds)
+}
+
+function ConvertTo-BsmmHex {
+    param([byte[]]$Bytes)
+    return ([BitConverter]::ToString($Bytes) -replace '-', '').ToLower()
+}
+
+# --- Severity: what counts as a failure ------------------------------------------------------------
+# These checks look at Windows in general, not at Roblox. What they find (cracked software, a game mod,
+# an old driver, Defender switched off) is a reason for staff to look, not proof of cheating in Roblox.
+# A failure there is reported as a warning unless the line names a known cheat, Roblox, or league policy.
+# Checks that catch evidence being wiped or this check being tampered with are not in the list.
+$script:ReviewOnlyChecks = @(
+    'UAC & Prompts', 'Windows Defender', 'Defender Exclusions', 'Allowed Threats', 'Defender Registry Overrides',
+    'Active Defender Threats', 'Defender History', 'Windows Security Settings', 'Memory Integrity (HVCI)',
+    'Root Certificates', 'Kernel Drivers', 'Process Scan', 'OBS & App Tamper', 'Suspicious Files', 'Signature Forgery',
+    'Hidden Data Streams', 'Download Origins', 'Autorun / Persistence', 'Encrypted & Virtual Drives', 'Hidden Drive Letters'
+)
+
+function Limit-BsmmSeverity {
+    param([string]$Check, [string[]]$Lines)
+    if ($script:ReviewOnlyChecks -notcontains $Check) { return $Lines }
+    return @(foreach ($line in @($Lines)) {
+        $keep = $line -notlike 'FAILURE*' -or $line -match '(?i)roblox|bloxstrap|fishstrap|league policy'
+        if (-not $keep) {
+            # "[wave]" style tags are put on a line by the check that matched a known cheat name
+            foreach ($tag in [regex]::Matches($line, '\[([^\]\r\n]{2,40})\]')) {
+                if ($script:CheatKeywords -contains $tag.Groups[1].Value) { $keep = $true; break }
+            }
+        }
+        if ($keep) { $line } else { 'WARNING' + $line.Substring(7) }
+    })
+}
+
+# --- Roblox accounts on this PC --------------------------------------------------------------------
+# Only account numbers and times are used. Login tokens are never touched: RobloxCookies.dat is not
+# opened, and from appStorage.json only the UserId and PreviousAccountsList entries are picked out.
+$script:RobloxIdPattern = '^[1-9]\d{0,18}$'
+$script:RobloxJoinRegex = New-Object System.Text.RegularExpressions.Regex ('(?m)^(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d(?:\.\d+)?Z),[^\r\n]*?game_join_loadtime: placeid:(\d+),[^\r\n]*?universeid:(\d+),[^\r\n]*?userid:(\d+)')
+$script:RobloxIdentity = $null
+
+function Add-BsmmRobloxAccount {
+    param([hashtable]$Accounts, [string]$Id, [string]$Source, [int64]$Last = 0)
+    if ($Id -notmatch $script:RobloxIdPattern) { return }
+    if (-not $Accounts.ContainsKey($Id)) { $Accounts[$Id] = @{ id = $Id; sources = @(); last = [int64]0 } }
+    $account = $Accounts[$Id]
+    if ($account.sources -notcontains $Source) { $account.sources += $Source }
+    if ($Last -gt $account.last) { $account.last = $Last }
+}
+
+# Which Roblox accounts have been used on this PC and the last games they joined. Worked out once.
+#   switcher  the account switcher's saved list     logs  Roblox's own log files     studio  Roblox Studio's per-account folders
+function Get-BsmmRobloxIdentity {
+    if ($script:RobloxIdentity) { return $script:RobloxIdentity }
+    $accounts = @{}
+    $userId = ''
+    $root = Join-Path $env:LOCALAPPDATA 'Roblox'
+
+    $storage = Join-Path $root 'LocalStorage\appStorage.json'
+    $hasStorage = Test-Path -LiteralPath $storage -PathType Leaf
+    if ($hasStorage) {
+        try {
+            $text = Read-BsmmTextFile -Path $storage
+            if ($text -cmatch '"UserId"\s*:\s*"?(\d+)"?') {
+                $userId = $matches[1]
+                Add-BsmmRobloxAccount -Accounts $accounts -Id $userId -Source 'switcher'
+            }
+            if ($text -cmatch '"PreviousAccountsList"\s*:\s*("(?:[^"\\]|\\.)*")') {
+                $previous = ($matches[1] | ConvertFrom-Json) | ConvertFrom-Json
+                foreach ($entry in @($previous.PSObject.Properties)) {
+                    $last = [int64]0
+                    try { $last = [int64]$entry.Value.signOutTimestamp } catch {}
+                    if ($last -gt 100000000000) { $last = [int64][Math]::Floor($last / 1000) }   # milliseconds
+                    $id = [string]$entry.Value.userId
+                    if (-not $id) { $id = [string]$entry.Name }
+                    Add-BsmmRobloxAccount -Accounts $accounts -Id $id -Source 'switcher' -Last $last
+                }
+            }
+            $text = $null
+        } catch {}
+    }
+
+    $games = New-Object System.Collections.Generic.List[object]
+    $logs = @()
+    try {
+        $logs = @(Get-ChildItem -LiteralPath (Join-Path $root 'logs') -File -Filter '*_Player_*_last.log' -ErrorAction Stop |
+            Where-Object { $_.Name -notmatch 'CrashHandler' } | Sort-Object LastWriteTime -Descending)
+    } catch {}
+    $styles = [Globalization.DateTimeStyles]::AssumeUniversal -bor [Globalization.DateTimeStyles]::AdjustToUniversal
+    foreach ($log in @($logs | Select-Object -First 40)) {
+        $text = ''
+        try { $text = Read-BsmmTextFile -Path $log.FullName } catch { continue }
+        foreach ($join in $script:RobloxJoinRegex.Matches($text)) {
+            $at = [int64]0
+            try { $at = Get-BsmmUnix ([datetime]::Parse($join.Groups[1].Value, [Globalization.CultureInfo]::InvariantCulture, $styles)) } catch {}
+            $player = $join.Groups[4].Value
+            Add-BsmmRobloxAccount -Accounts $accounts -Id $player -Source 'logs' -Last $at
+            if ($at -gt 0 -and $player -match $script:RobloxIdPattern) {
+                $games.Add(@{ placeId = $join.Groups[2].Value; universeId = $join.Groups[3].Value; at = $at; userId = $player })
+            }
+        }
+    }
+
+    try {
+        foreach ($dir in [IO.Directory]::GetDirectories($root)) {
+            $name = [IO.Path]::GetFileName($dir)
+            if ($name -match '^\d{3,19}$') { Add-BsmmRobloxAccount -Accounts $accounts -Id $name -Source 'studio' -Last (Get-BsmmUnix ([IO.Directory]::GetLastWriteTime($dir))) }
+        }
+    } catch {}
+
+    $newestLog = $null
+    if ($logs.Count -gt 0) { $newestLog = $logs[0].LastWriteTime }
+    $script:RobloxIdentity = @{
+        userId     = $userId
+        accounts   = @($accounts.Values | Sort-Object { $_.last } -Descending | Select-Object -First 40)
+        games      = @($games | Sort-Object { $_.at } -Descending | Select-Object -First 12)
+        LogCount   = $logs.Count
+        NewestLog  = $newestLog
+        HasStorage = $hasStorage
+    }
+    return $script:RobloxIdentity
+}
+
+# Roblox was used but its logs or saved accounts are gone: they were removed to hide alts or what was played.
+function Get-RobloxAccountDataAlerts {
+    $alerts = New-Object System.Collections.Generic.List[string]
+    $id = Get-BsmmRobloxIdentity
+    $lastRun = $null
+    foreach ($run in @(Get-BsmmProgramHistory)) {
+        if ($run.Source -ne 'exit' -and $run.Path -match '(?i)(^|\\)RobloxPlayerBeta\.exe$' -and (-not $lastRun -or $run.Time -gt $lastRun)) { $lastRun = $run.Time }
+    }
+    $ranText = ''
+    if ($lastRun) { $ranText = Get-Date $lastRun -Format 'yyyy-MM-dd HH:mm' }
+
+    if (-not $lastRun -and $id.LogCount -eq 0 -and -not $id.HasStorage) {
+        $alerts.Add('WARNING: No sign that Roblox has been played on this PC (no logs, no saved account, no run history) - the player may be using a different PC')
+    }
+    # Roblox keeps its logs for several days, so a run in the last 3 days always has one.
+    if ($lastRun -and $lastRun -gt (Get-Date).AddDays(-3)) {
+        if ($id.LogCount -eq 0) {
+            $alerts.Add("WARNING: Roblox ran $ranText but the Roblox log folder has no game logs (the logs were deleted)")
+        } elseif ($id.NewestLog -lt $lastRun.AddMinutes(-30)) {
+            $alerts.Add("WARNING: Roblox ran $ranText but the newest Roblox log is from $(Get-Date $id.NewestLog -Format 'yyyy-MM-dd HH:mm') (later logs were deleted)")
+        }
+    }
+    if (-not $id.HasStorage -and ($lastRun -or $id.LogCount -gt 0)) {
+        $alerts.Add('WARNING: The saved Roblox account list (appStorage.json) is missing although Roblox has been used on this PC (account history was removed)')
+    } elseif ($id.HasStorage -and -not $id.userId) {
+        $alerts.Add('INFO: No Roblox account is logged in right now')
+    }
+    $count = @{ switcher = 0; logs = 0; studio = 0 }
+    foreach ($account in @($id.accounts)) { foreach ($source in $account.sources) { $count[$source]++ } }
+    $alerts.Add("INFO: $(@($id.accounts).Count) Roblox accounts found on this PC (account switcher $($count.switcher), game logs $($count.logs), Studio $($count.studio)); $($id.LogCount) game logs kept")
+    if (-not ($alerts | Where-Object { $_ -like 'WARNING*' })) { $alerts.Insert(0, 'SUCCESS: Roblox logs and saved account data are in place') }
+    return @($alerts)
+}
+
+# --- PC fingerprint --------------------------------------------------------------------------------
+# One-way hash of hardware serial numbers. Staff see whether two checks came from the same PC,
+# never the serial numbers themselves.
+function Get-BsmmPcFingerprint {
+    $placeholder = '(?i)^(|none|default string|to be filled by o\.?e\.?m\.?|system serial number|base board serial number|not applicable|not specified|n/a|unknown|[0-]+|[f-]+|123456789|03000200-0400-0500-0006-000700080009)$'
+    $values = @()
+    try { $values += [string](Get-CimInstance Win32_ComputerSystemProduct -ErrorAction Stop | Select-Object -First 1).UUID } catch {}
+    try { $values += [string](Get-CimInstance Win32_BaseBoard -ErrorAction Stop | Select-Object -First 1).SerialNumber } catch {}
+    try { $values += [string](Get-CimInstance Win32_Processor -ErrorAction Stop | Select-Object -First 1).ProcessorId } catch {}
+    $real = @($values | ForEach-Object { $_.Trim().ToUpper() } | Where-Object { $_ -notmatch $placeholder })
+    if ($real.Count -lt 2) {
+        try { $real += ([string](Get-ItemPropertyValue -Path 'HKLM:\SOFTWARE\Microsoft\Cryptography' -Name MachineGuid -ErrorAction Stop)).ToUpper() } catch {}
+    }
+    if ($real.Count -eq 0) { return '' }
+    $sha = [System.Security.Cryptography.SHA256]::Create()
+    try { return (ConvertTo-BsmmHex $sha.ComputeHash([Text.Encoding]::UTF8.GetBytes('bsmm-pc-v1|' + ($real -join '|')))) } finally { $sha.Dispose() }
+}
+
+# --- Program timeline ------------------------------------------------------------------------------
+# Every place Windows writes down that a program started, with the exact time. The relay lines these
+# up with the player's matches. Sources: running programs, Prefetch, BAM, the Windows launch log,
+# abnormal exits from the same log, Explorer's UserAssist, and Prefetch writes in the change journal.
+$script:ProgramHistory = $null
+$script:JournalPrefetch = $null     # filled by Get-ChangeJournalAlerts
+
+function Add-BsmmRun {
+    param($Runs, [string]$Path, $Time, [string]$Source, [int]$Count = 0)
+    if (-not $Path -or -not ($Time -is [datetime]) -or $Time.Year -lt 2015 -or $Time -gt (Get-Date).AddDays(1)) { return }
+    $Runs.Add([pscustomobject]@{ Path = $Path; Time = $Time; Source = $Source; Runs = $Count })
+}
+
+# "\VOLUME{01d9...-A1B2C3D4}\USERS\..." (Prefetch) or "\Device\HarddiskVolume3\Users\..." -> "C:\Users\..."
+# A path on a drive that is no longer connected is returned as it is.
+function Resolve-BsmmDevicePath {
+    param([string]$Path, [hashtable]$Serials, [hashtable]$Volumes)
+    if ($Path -match '^[A-Za-z]:\\') { return $Path }
+    if ($Path -match '(?i)^\\VOLUME\{[0-9a-f]+-([0-9a-f]+)\}(\\.+)$') {
+        $serial = $matches[1].TrimStart('0').ToUpper()
+        if ($Serials.ContainsKey($serial)) { return $Serials[$serial] + $matches[2] }
+    } elseif ($Path -match '(?i)^(\\Device\\HarddiskVolume\d+)(\\.+)$') {
+        if ($Volumes.ContainsKey($matches[1])) { return $Volumes[$matches[1]] + $matches[2] }
+    }
+    return $Path
+}
+
+# Raw list of @{ Path; Time; Source; Runs }, one per recorded start (or abnormal exit). Worked out once.
+function Get-BsmmProgramHistory {
+    if ($script:ProgramHistory) { return $script:ProgramHistory }
+    $runs = New-Object System.Collections.Generic.List[object]
+    $admin = $false; try { $admin = [bool](Test-Admin) } catch {}
+    $volumes = @{}; try { $volumes = Get-BsmmVolumeMap } catch {}
+    $serials = @{}
+    try {
+        foreach ($disk in @(Get-CimInstance Win32_LogicalDisk -ErrorAction Stop)) {
+            if ($disk.VolumeSerialNumber) { $serials[([string]$disk.VolumeSerialNumber).TrimStart('0').ToUpper()] = [string]$disk.DeviceID }
+        }
+    } catch {}
+    $culture = [Globalization.CultureInfo]::InvariantCulture
+    $utc = [Globalization.DateTimeStyles]::AssumeUniversal
+
+    # 1. running now: one entry per program, at its earliest start
+    try {
+        $started = @{}
+        foreach ($p in @(Get-CimInstance Win32_Process -Property ExecutablePath, CreationDate -ErrorAction Stop)) {
+            if (-not $p.ExecutablePath -or -not $p.CreationDate) { continue }
+            $key = [string]$p.ExecutablePath
+            if (-not $started.ContainsKey($key) -or $p.CreationDate -lt $started[$key]) { $started[$key] = $p.CreationDate }
+        }
+        foreach ($key in $started.Keys) { Add-BsmmRun -Runs $runs -Path $key -Time $started[$key] -Source 'running' }
+    } catch {}
+
+    # 2. Prefetch: the last 8 starts of each program and how often it ran
+    $prefetchPaths = @{}    # "NAME.EXE-1A2B3C4D.pf" -> full path
+    if ($admin -and (Initialize-BsmmForensics)) {
+        try {
+            foreach ($file in [IO.Directory]::GetFiles((Join-Path $env:SystemRoot 'Prefetch'), '*.pf')) {
+                $info = $null
+                try { $info = [BSMM.Timeline]::Prefetch($file) } catch {}
+                if (-not $info -or -not $info.Exe) { continue }
+                $path = $info.Exe
+                if ($info.Path) { $path = Resolve-BsmmDevicePath -Path $info.Path -Serials $serials -Volumes $volumes }
+                $prefetchPaths[[IO.Path]::GetFileName($file)] = $path
+                foreach ($time in $info.Times) { Add-BsmmRun -Runs $runs -Path $path -Time $time -Source 'prefetch' -Count $info.RunCount }
+            }
+        } catch {}
+    }
+
+    # 3. BAM: the last start of each program, kept by Windows for about a week
+    if ($admin) {
+        try {
+            foreach ($entry in @(Get-BamEntries)) {
+                Add-BsmmRun -Runs $runs -Path (Resolve-BsmmDevicePath -Path $entry.Raw -Serials $serials -Volumes $volumes) -Time $entry.Time -Source 'bam'
+            }
+        } catch {}
+    }
+
+    # 4. Windows launch log (Windows 11 22H2 and newer): the last start of each program
+    $pca = Join-Path $env:SystemRoot 'appcompat\pca'
+    try {
+        foreach ($line in ((Read-BsmmTextFile -Path (Join-Path $pca 'PcaAppLaunchDic.txt')) -split "`r?`n")) {
+            $cut = $line.LastIndexOf('|')
+            if ($cut -lt 1) { continue }
+            $time = [datetime]::MinValue
+            if ([datetime]::TryParse($line.Substring($cut + 1).Trim(), $culture, $utc, [ref]$time)) {
+                Add-BsmmRun -Runs $runs -Path $line.Substring(0, $cut).Trim() -Time $time -Source 'launch'
+            }
+        }
+    } catch {}
+
+    # 5. the same log's record of programs that were killed or crashed (how a cheat usually ends)
+    foreach ($name in @('PcaGeneralDb0.txt', 'PcaGeneralDb1.txt')) {
+        try {
+            $perProgram = @{}
+            $lines = (Read-BsmmTextFile -Path (Join-Path $pca $name)) -split "`r?`n"
+            for ($i = $lines.Count - 1; $i -ge 0; $i--) {      # newest last in the file
+                $fields = $lines[$i].Split('|')
+                if ($fields.Count -lt 3 -or $fields[1] -ne '2') { continue }
+                $path = [Environment]::ExpandEnvironmentVariables($fields[2].Trim())
+                if ($path.StartsWith('\') -and -not $path.StartsWith('\\')) { $path = $env:SystemDrive + $path }
+                $perProgram[$path] = 1 + [int]$perProgram[$path]
+                if ($perProgram[$path] -gt 20) { continue }
+                $time = [datetime]::MinValue
+                if ([datetime]::TryParse($fields[0].Trim(), $culture, $utc, [ref]$time)) { Add-BsmmRun -Runs $runs -Path $path -Time $time -Source 'exit' }
+            }
+        } catch {}
+    }
+
+    # 6. Explorer's UserAssist: programs the player opened by hand, with the last time and a count
+    try {
+        $rootKey = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey('Software\Microsoft\Windows\CurrentVersion\Explorer\UserAssist')
+        if ($rootKey) {
+            foreach ($guid in $rootKey.GetSubKeyNames()) {
+                $countKey = $rootKey.OpenSubKey("$guid\Count")
+                if (-not $countKey) { continue }
+                foreach ($valueName in $countKey.GetValueNames()) {
+                    $raw = $countKey.GetValue($valueName)
+                    if (-not ($raw -is [byte[]]) -or $raw.Length -lt 68) { continue }
+                    $stamp = [BitConverter]::ToInt64($raw, 60)
+                    if ($stamp -le 0) { continue }
+                    $name = ConvertFrom-Rot13 $valueName
+                    if ($name -match '^(\{[0-9A-Fa-f\-]{36}\})\\(.*)$' -and $script:KnownFolderGuids[$matches[1]]) { $name = Join-Path $script:KnownFolderGuids[$matches[1]] $matches[2] }
+                    if ($name -notmatch '(?i)^[A-Z]:\\.+\.(exe|bat|cmd|com|scr|ahk|ps1|vbs|msi|jar)$') { continue }
+                    $time = $null
+                    try { $time = [DateTime]::FromFileTime($stamp) } catch { continue }
+                    Add-BsmmRun -Runs $runs -Path $name -Time $time -Source 'userassist' -Count ([BitConverter]::ToInt32($raw, 4))
+                }
+                $countKey.Close()
+            }
+            $rootKey.Close()
+        }
+    } catch {}
+
+    # 7. change journal: Windows rewrites a program's Prefetch file each time it starts, and the journal
+    #    keeps those writes even after the Prefetch file itself has been deleted
+    if ($script:JournalPrefetch -and $script:JournalPrefetch.Count -gt 0) {
+        $byLeaf = @{}
+        foreach ($run in $runs) {
+            if ($run.Path -match '^[A-Za-z]:\\') { $byLeaf[[IO.Path]::GetFileName($run.Path).ToUpper()] = $run.Path }
+        }
+        $lastWrite = @{}
+        foreach ($write in @($script:JournalPrefetch | Sort-Object Time)) {
+            $file = [string]$write.Name
+            if ($lastWrite.ContainsKey($file) -and ($write.Time - $lastWrite[$file]).TotalSeconds -lt 10) { $lastWrite[$file] = $write.Time; continue }
+            $lastWrite[$file] = $write.Time
+            $exe = $file -replace '(?i)-[0-9A-F]{6,8}\.pf$', ''
+            $path = $exe
+            if ($prefetchPaths.ContainsKey($file)) { $path = $prefetchPaths[$file] }
+            elseif ($byLeaf.ContainsKey($exe.ToUpper())) { $path = $byLeaf[$exe.ToUpper()] }
+            elseif (Test-Path -LiteralPath (Join-Path $env:SystemRoot "System32\$exe") -PathType Leaf) { continue }
+            Add-BsmmRun -Runs $runs -Path $path -Time $write.Time -Source 'journal'
+        }
+    }
+
+    $script:ProgramHistory = $runs
+    return $runs
+}
+
+# An app that updates itself moves to a new version folder and removes the old one (Roblox, Discord).
+# Returns the same program in a sibling version folder, or $null when the program is simply gone.
+function Get-BsmmUpdatedProgramPath {
+    param([string]$Path)
+    try {
+        $parent = [IO.Path]::GetDirectoryName($Path)
+        $root = [IO.Path]::GetDirectoryName($parent)
+        if (-not $root -or [IO.Path]::GetFileName($parent) -notmatch '\d' -or [IO.Directory]::Exists($parent) -or -not [IO.Directory]::Exists($root)) { return $null }
+        foreach ($dir in [IO.Directory]::GetDirectories($root)) {
+            if ([IO.Path]::GetFileName($dir) -notmatch '\d') { continue }
+            $candidate = [IO.Path]::Combine($dir, [IO.Path]::GetFileName($Path))
+            if ([IO.File]::Exists($candidate)) { return $candidate }
+        }
+    } catch {}
+    return $null
+}
+
+# signed = valid signature from a certificate authority Windows ships with; unsigned = anything else on disk;
+# missing = the file is gone; unknown = could not be looked at.
+$script:ProgramSignatures = @{}
+function Get-BsmmProgramSignature {
+    param([string]$Path)
+    if ($script:ProgramSignatures.ContainsKey($Path)) { return $script:ProgramSignatures[$Path] }
+    $result = @{ sig = 'unknown'; signer = '' }
+    if ($Path -match '^\\') { $result.sig = 'missing' }      # on a drive that is no longer connected
+    elseif ($Path -match '^[A-Za-z]:\\') {
+        $file = $Path
+        try {
+            if (-not [IO.File]::Exists($file)) { $file = Get-BsmmUpdatedProgramPath -Path $Path }
+            if (-not $file) { $result.sig = 'missing' }
+            else {
+                $sig = Get-BsmmSignature -Path $file
+                # a Store app is signed as a whole package, not file by file
+                if ((-not $sig -or [string]$sig.Status -ne 'Valid') -and $file -match '(?i)^(.+?\\(WindowsApps|SystemApps)\\[^\\]+)\\') {
+                    $package = Get-BsmmSignature -Path ($matches[1] + '\AppxSignature.p7x')
+                    if ($package -and [string]$package.Status -eq 'Valid') { $sig = $package }
+                }
+                if ($sig) {
+                    $result.sig = 'unsigned'
+                    if ([string]$sig.Status -eq 'Valid' -and $sig.SignerCertificate) {
+                        $rootThumbprint = Get-SignatureRootThumbprint -Certificate $sig.SignerCertificate
+                        if ($rootThumbprint -and -not (Test-UserInstalledRootThumbprint -Thumbprint $rootThumbprint)) { $result.sig = 'signed' }
+                    }
+                    $result.signer = Limit-BsmmText (Get-BsmmSigner $sig) 60
+                }
+            }
+        } catch {}
+    }
+    $script:ProgramSignatures[$Path] = $result
+    return $result
+}
+
+# The timeline as it is sent: newest first, Windows' own programs left out, each with its signature state.
+function Get-BsmmProgramRuns {
+    $windows = ($env:SystemRoot + '\').ToLower()
+    $monthAgo = (Get-Date).AddDays(-30)
+    $history = @(Get-BsmmProgramHistory | Sort-Object Time -Descending)
+    $cased = @{}    # Prefetch stores paths in capitals; show them the way the other sources spell them
+    foreach ($run in $history) { if ($run.Source -ne 'prefetch' -and $run.Source -ne 'journal') { $cased[[string]$run.Path] = [string]$run.Path } }
+
+    $kept = New-Object System.Collections.Generic.List[object]
+    $seen = New-Object 'System.Collections.Generic.HashSet[string]'
+    foreach ($run in $history) {
+        $path = [string]$run.Path
+        if ($cased.ContainsKey($path)) { $path = $cased[$path] }
+        $lower = $path.ToLower()
+        # launch and userassist hold one entry per program for good, so the relay can tell when one is removed
+        if ($run.Time -lt $monthAgo -and $run.Source -ne 'launch' -and $run.Source -ne 'userassist') { continue }
+        if ($lower.StartsWith($windows)) {
+            if ($lower -match '\\(softwaredistribution|winsxs|servicing|assembly|microsoft\.net)\\') { continue }
+            if ($lower -notmatch '\\temp\\' -and [IO.File]::Exists($path)) { continue }
+        }
+        $at = Get-BsmmUnix $run.Time
+        if (-not $seen.Add("$($run.Source)|$at|$lower")) { continue }
+        $kept.Add(@{ path = $path; at = $at; src = [string]$run.Source; runs = [int]$run.Runs; recent = ($run.Time -ge $monthAgo) })
+        if ($kept.Count -ge 2500) { break }
+    }
+
+    # Signatures are slow to check, so the time spent is capped: what is running now goes first, then newest first.
+    $clock = [Diagnostics.Stopwatch]::StartNew()
+    foreach ($run in $kept) { if ($run.src -eq 'running') { [void](Get-BsmmProgramSignature -Path $run.path) } }
+    return @(foreach ($run in $kept) {
+        $state = @{ sig = 'unknown'; signer = '' }
+        if ($run.recent -and ($clock.Elapsed.TotalSeconds -lt 40 -or $script:ProgramSignatures.ContainsKey($run.path))) { $state = Get-BsmmProgramSignature -Path $run.path }
+        @{ path = (Limit-BsmmText (Protect-BsmmText $run.path) 300); at = $run.at; src = $run.src; sig = $state.sig; signer = $state.signer; runs = $run.runs }
+    })
+}
+
+# --- ImGui traces ----------------------------------------------------------------------------------
+# Almost every cheat menu and overlay is drawn with the ImGui library, which saves its window layout
+# to a file called imgui.ini in the folder the program was started from. The file stays behind after
+# the cheat is closed, and it lists the menu's window titles.
+$script:ImGuiIgnorePaths = '(?i)\\(steamapps|Program Files( \(x86\))?|WindowsApps|Epic Games|Riot Games)\\'
+$script:ImGuiHotPaths = '(?i)\\AppData\\Local\\(Roblox|Bloxstrap|Fishstrap)\\|\\Roblox\\Versions\\'
+
+# Full paths of every file called $Name at most $Depth folders below $Root. Links to other folders are not followed.
+function Find-BsmmFile {
+    param([string]$Root, [string]$Name, [int]$Depth)
+    $hits = New-Object System.Collections.Generic.List[string]
+    if (-not $Root -or -not [IO.Directory]::Exists($Root)) { return $hits }
+    $stack = New-Object System.Collections.Stack
+    $stack.Push(@($Root, 0))
+    while ($stack.Count -gt 0) {
+        $item = $stack.Pop()
+        $file = [IO.Path]::Combine($item[0], $Name)
+        if ([IO.File]::Exists($file)) { $hits.Add($file) }
+        if ($item[1] -ge $Depth) { continue }
+        try {
+            foreach ($sub in (New-Object IO.DirectoryInfo $item[0]).GetDirectories()) {
+                if (($sub.Attributes -band [IO.FileAttributes]::ReparsePoint) -eq 0) { $stack.Push(@($sub.FullName, ($item[1] + 1))) }
+            }
+        } catch {}
+    }
+    return $hits
+}
+
+function Get-ImGuiTraceAlerts {
+    param([datetime]$Since = [datetime]::MinValue)    # live monitor: only files written after this time
+    $places = @(
+        @{ Depth = 3; Roots = @(Get-BsmmUserFolders Desktop) + @(Get-BsmmUserFolders Downloads) + @(Get-BsmmUserFolders Documents) + @($env:LOCALAPPDATA, $env:APPDATA) },
+        @{ Depth = 2; Roots = @($env:TEMP, $env:ProgramData, "${env:ProgramFiles(x86)}\Roblox\Versions") },
+        @{ Depth = 1; Roots = @($env:SystemDrive + '\') },
+        @{ Depth = 0; Roots = @($env:USERPROFILE, $env:SystemRoot, (Join-Path $env:SystemRoot 'System32'), (Join-Path $env:SystemRoot 'SysWOW64')) }
+    )
+    $found = @{}
+    foreach ($place in $places) {
+        foreach ($root in $place.Roots) { foreach ($file in @(Find-BsmmFile -Root $root -Name 'imgui.ini' -Depth $place.Depth)) { $found[$file] = $true } }
+    }
+
+    $alerts = New-Object System.Collections.Generic.List[string]
+    $weekAgo = (Get-Date).AddDays(-7)
+    $windows = ($env:SystemRoot + '\').ToLower()
+    foreach ($path in @($found.Keys | Sort-Object)) {
+        if ($path -match $script:ImGuiIgnorePaths) { continue }
+        $written = $null
+        try { $written = [IO.File]::GetLastWriteTime($path) } catch { continue }
+        if ($written -lt $Since) { continue }
+        $titles = @()
+        try {
+            if ((New-Object IO.FileInfo $path).Length -le 512KB) {
+                $titles = @([regex]::Matches((Read-BsmmTextFile -Path $path), '(?m)^\[Window\]\[([^\]\r\n]{1,60})\]') | ForEach-Object { $_.Groups[1].Value } |
+                    Where-Object { $_ -notmatch '^Debug##' } | Select-Object -Unique -First 6)
+            }
+        } catch {}
+        $kw = Get-MatchedCheatKeyword -Text $path
+        foreach ($title in $titles) { if (-not $kw) { $kw = Get-MatchedCheatKeyword -Text $title } }
+        $detail = "last written $(Get-Date $written -Format 'yyyy-MM-dd HH:mm:ss') -> $path"
+        if ($titles.Count -gt 0) { $detail += " (menu windows: $($titles -join ', '))" }
+        if ($kw) { $alerts.Add("FAILURE: ImGui menu settings file [$kw] $detail") }
+        elseif ($path -match $script:ImGuiHotPaths) { $alerts.Add("FAILURE: ImGui menu settings file inside the Roblox folder (a menu was drawn inside Roblox) $detail") }
+        elseif ($path.ToLower().StartsWith($windows)) { $alerts.Add("WARNING: ImGui menu settings file in a Windows folder (left by a menu program that was started as administrator) $detail") }
+        elseif ($written -ge $weekAgo) { $alerts.Add("WARNING: ImGui menu settings file used in the last 7 days $detail") }
+        else { $alerts.Add("INFO: Old ImGui menu settings file $detail") }
+    }
+    if (-not ($alerts | Where-Object { $_ -like 'FAILURE*' -or $_ -like 'WARNING*' })) { $alerts.Insert(0, 'SUCCESS: No recent ImGui menu settings files (imgui.ini) found') }
+    return @($alerts | Select-Object -First 25)
+}
+
+# --- Sending ---------------------------------------------------------------------------------------
 function Invoke-BsmmHttp {
     param([string]$Method, [string]$Url, [byte[]]$Body, [string]$ContentType, [hashtable]$Headers = @{})
     for ($attempt = 1; $attempt -le 2; $attempt++) {
@@ -5772,8 +6219,8 @@ function Invoke-BsmmHttp {
             $req.ContentType = $ContentType
             foreach ($h in $Headers.Keys) { $req.Headers[$h] = [string]$Headers[$h] }
             $req.UserAgent = "BSMM-AntiCheat/$($script:Brand.Version)"
-            $req.Timeout = 10000
-            $req.ReadWriteTimeout = 10000
+            $req.Timeout = 30000
+            $req.ReadWriteTimeout = 30000
             $req.ContentLength = $Body.Length
             $stream = $req.GetRequestStream()
             $stream.Write($Body, 0, $Body.Length)
@@ -5787,7 +6234,7 @@ function Invoke-BsmmHttp {
             $code = 0; $retry = 2
             try { $code = [int]$_.Exception.Response.StatusCode } catch {}
             try { $ra = $_.Exception.Response.Headers['Retry-After']; if ($ra) { $retry = [Math]::Min(5, [Math]::Ceiling([double]$ra)) } } catch {}
-            if ($code -eq 429 -and $attempt -eq 1) { Start-Sleep -Seconds $retry; continue }
+            if (($code -eq 429 -or $code -eq 0) -and $attempt -eq 1) { Start-Sleep -Seconds $retry; continue }
             return @{ Ok = $false; Code = $code; Error = $_.Exception.Message }
         } catch {
             return @{ Ok = $false; Code = 0; Error = $_.Exception.Message }
@@ -5796,49 +6243,26 @@ function Invoke-BsmmHttp {
     return @{ Ok = $false; Code = 429; Error = 'rate limited' }
 }
 
-function Test-BsmmRelay {
-    $url = [string]$script:Report.RelayUrl
-    return ($url -match '^https://[^\s/]+' -or $url -match '^http://(127\.0\.0\.1|localhost)(:\d+)?') -and $url -notmatch 'YOUR-SUBDOMAIN'
-}
-
-$script:RelayKeys = @{}
-
-# Posts (or edits, with -MessageId) a report message through the relay. Returns the message id, or $null on failure.
-function Send-BsmmWebhook {
-    param([hashtable]$Payload, [string]$FileName = '', [string]$FileText = '', [string]$MessageId = '')
-    if (-not (Test-BsmmRelay)) { return $null }
-    $url = ([string]$script:Report.RelayUrl).TrimEnd('/')
-    $Payload['allowed_mentions'] = @{ parse = @() }    # never ping anyone
-    $json = ConvertTo-Json -InputObject $Payload -Depth 10 -Compress
+# Sends one message to the relay, signed with this check's one-time key. The relay refuses anything
+# that was not signed with it, was changed on the way, or was sent before. Returns $true when accepted.
+function Send-BsmmSigned {
+    param([string]$Path, [int]$Seq, [hashtable]$Body)
     $enc = New-Object System.Text.UTF8Encoding($false)
-
-    if ($MessageId) {
-        $key = [string]$script:RelayKeys[$MessageId]
-        $r = Invoke-BsmmHttp -Method 'PATCH' -Url "$url/report/$MessageId" -Body $enc.GetBytes($json) -ContentType 'application/json' -Headers @{ 'X-Edit-Key' = $key }
-        if ($r.Ok) { return $MessageId }
-        return $null
+    $bytes = $enc.GetBytes((ConvertTo-Json -InputObject $Body -Depth 8 -Compress))
+    # the relay takes 1.5 MB at most; the oldest half of the program timeline goes first
+    while ($bytes.Length -gt 1400000 -and @($Body.programs).Count -gt 100) {
+        $Body.programs = @($Body.programs | Select-Object -First ([int](@($Body.programs).Count / 2)))
+        $bytes = $enc.GetBytes((ConvertTo-Json -InputObject $Body -Depth 8 -Compress))
     }
-
-    if ($FileName -and $FileText) {
-        $boundary = 'BSMM' + [guid]::NewGuid().ToString('N')
-        $ms = New-Object System.IO.MemoryStream
-        $parts = @(
-            "--$boundary`r`nContent-Disposition: form-data; name=`"payload_json`"`r`nContent-Type: application/json`r`n`r`n$json`r`n",
-            "--$boundary`r`nContent-Disposition: form-data; name=`"files[0]`"; filename=`"$FileName`"`r`nContent-Type: text/plain; charset=utf-8`r`n`r`n",
-            $FileText,
-            "`r`n--$boundary--`r`n"
-        )
-        foreach ($part in $parts) { $b = $enc.GetBytes($part); $ms.Write($b, 0, $b.Length) }
-        $r = Invoke-BsmmHttp -Method 'POST' -Url "$url/report" -Body $ms.ToArray() -ContentType "multipart/form-data; boundary=$boundary"
-    } else {
-        $r = Invoke-BsmmHttp -Method 'POST' -Url "$url/report" -Body $enc.GetBytes($json) -ContentType 'application/json'
-    }
-    if (-not $r.Ok) { return $null }
+    $sha = [System.Security.Cryptography.SHA256]::Create()
+    $hmac = New-Object System.Security.Cryptography.HMACSHA256 (, $enc.GetBytes([string]$script:Session.Key))
     try {
-        $resp = $r.Body | ConvertFrom-Json
-        if ($resp.key) { $script:RelayKeys[[string]$resp.id] = [string]$resp.key }
-        return [string]$resp.id
-    } catch { return 'sent' }
+        $digest = ConvertTo-BsmmHex $sha.ComputeHash($bytes)
+        $signature = ConvertTo-BsmmHex $hmac.ComputeHash($enc.GetBytes("$($script:Session.Id).$Seq.$digest"))
+    } finally { $sha.Dispose(); $hmac.Dispose() }
+    $headers = @{ 'X-Bsmm-Check' = [string]$script:Session.Id; 'X-Bsmm-Seq' = "$Seq"; 'X-Bsmm-Sig' = $signature }
+    $result = Invoke-BsmmHttp -Method 'POST' -Url (([string]$script:Session.Relay).TrimEnd('/') + $Path) -Body $bytes -ContentType 'application/json' -Headers $headers
+    return [bool]$result.Ok
 }
 
 function Get-BsmmSystemFacts {
@@ -5859,114 +6283,44 @@ function Get-BsmmSystemFacts {
             $facts['Roblox'] = "$($v.VersionHash) ($state)"
         } else { $facts['Roblox'] = 'not found' }
     } catch {}
-    $admin = $false; try { $admin = Test-Admin } catch {}
-    $facts['Admin'] = $(if ($admin) { 'Yes' } else { 'NO - checks incomplete' })
     if ($script:CodeFingerprint) { $facts['Code'] = $script:CodeFingerprint }
     return $facts
 }
 
-function Get-BsmmReportHeader {
-    $player = $script:PlayerName; if (-not $player) { $player = '(not given)' }
-    return "Report $($script:ReportId)  |  Player $player  |  BSMM $($script:Brand.Product) v$($script:Brand.Version)"
-}
-
-# Full anonymised text log of step 1 (attached to the Discord message).
-function Get-BsmmSystemReportText {
-    param([array]$Results, $Trust, [int]$Seconds)
-    $sb = New-Object System.Text.StringBuilder
-    [void]$sb.AppendLine((Get-BsmmReportHeader))
-    [void]$sb.AppendLine("Generated $((Get-Date).ToUniversalTime().ToString('yyyy-MM-dd HH:mm:ss')) UTC  |  scan took ${Seconds}s")
-    [void]$sb.AppendLine("Trust score: $($Trust.Score)/100 ($($Trust.Label))  |  $($Trust.Fail) failed, $($Trust.Warn) to review, $($Results.Count) checks")
-    foreach ($kv in (Get-BsmmSystemFacts).GetEnumerator()) { [void]$sb.AppendLine("$($kv.Key): $($kv.Value)") }
-    [void]$sb.AppendLine('')
-    foreach ($r in $Results) {
-        [void]$sb.AppendLine(('[{0}] {1}' -f $r.Summary.Status, $r.Name))
-        foreach ($l in @($r.Lines)) {
-            if (-not (Test-BsmmReportLine -Section $r.Name -Line $l)) { continue }
-            [void]$sb.AppendLine('    ' + (Protect-BsmmText (($l -replace "`r?`n", ' | ') -replace '\s+', ' ')))
+# One check's lines as they are sent: personal details removed, one line each, bounded in size.
+function Get-BsmmReportChecks {
+    param([array]$Results)
+    return @(foreach ($result in @($Results)) {
+        $lines = New-Object System.Collections.Generic.List[string]
+        foreach ($line in @($result.Lines)) {
+            if (-not $line -or $lines.Count -ge 300 -or -not (Test-BsmmReportLine -Section $result.Name -Line $line)) { continue }
+            $lines.Add((Limit-BsmmText (Protect-BsmmText ((([string]$line) -replace "`r?`n", ' | ') -replace '\s+', ' ').Trim()) 700))
         }
-    }
-    return $sb.ToString()
-}
-
-function Send-BsmmSystemReport {
-    param([array]$Results, $Trust, [int]$Seconds)
-    $facts = Get-BsmmSystemFacts
-    $player = $script:PlayerName; if (-not $player) { $player = 'not given' }
-
-    $fields = @()
-    $fields += @{ name = 'Result'; value = "$($Trust.Fail) failed / $($Trust.Warn) to review / $($Results.Count) checks"; inline = $true }
-    foreach ($kv in $facts.GetEnumerator()) { $fields += @{ name = $kv.Key; value = (Limit-BsmmText (Protect-BsmmText ([string]$kv.Value)) 1000); inline = $true } }
-    $failNames = @($Results | Where-Object { $_.Summary.Status -eq 'FAIL' } | ForEach-Object { $_.Name })
-    $warnNames = @($Results | Where-Object { $_.Summary.Status -eq 'WARN' } | ForEach-Object { $_.Name })
-    if ($failNames.Count -gt 0) { $fields += @{ name = 'Failed checks'; value = (Limit-BsmmText ($failNames -join ', ') 1000); inline = $false } }
-    if ($warnNames.Count -gt 0) { $fields += @{ name = 'Needs review'; value = (Limit-BsmmText ($warnNames -join ', ') 1000); inline = $false } }
-
-    $findings = New-Object System.Collections.Generic.List[string]
-    foreach ($status in @('FAIL', 'WARN')) {
-        foreach ($r in @($Results | Where-Object { $_.Summary.Status -eq $status })) {
-            foreach ($l in @($r.Lines)) {
-                if ($l -notlike 'FAILURE*' -and $l -notlike 'WARNING*') { continue }
-                $tag = 'WARN'; if ($l -like 'FAILURE*') { $tag = 'FAIL' }
-                $msg = ($l -replace '^(FAILURE|WARNING):\s*', '') -replace "`r?`n", ' | ' -replace '\s+', ' '
-                $findings.Add("$tag  $($r.Name): $(Limit-BsmmText (Protect-BsmmText $msg) 220)")
-            }
-        }
-    }
-    $desc = "**Trust score: $($Trust.Score)/100 - $($Trust.Label)**`nReport ``$($script:ReportId)`` - Player ``$(Protect-BsmmText $player)```nMatch this report ID with the one on the recording."
-    $embeds = @(@{
-        title = "$($script:Brand.Name) $($script:Brand.Product) - System check"
-        description = $desc
-        color = $Trust.Color
-        fields = $fields
-        footer = @{ text = "BSMM v$($script:Brand.Version) - scan took ${Seconds}s" }
-        timestamp = (Get-Date).ToUniversalTime().ToString('o')
+        # a check with nothing to say would read as "needs review" on the relay
+        if ($lines.Count -eq 0 -and @($result.Lines).Count -gt 0) { $lines.Add('SUCCESS: Nothing to report') }
+        @{ name = [string]$result.Name; lines = $lines.ToArray() }
     })
-    if ($findings.Count -gt 0) {
-        $body = ''
-        $shown = 0
-        foreach ($f in $findings) {
-            if (($body.Length + $f.Length + 1) -gt 3600) { break }
-            $body += $f + "`n"; $shown++
-        }
-        if ($shown -lt $findings.Count) { $body += "... $($findings.Count - $shown) more in the attached log`n" }
-        $embeds += @{ title = "Findings ($($findings.Count))"; description = "``````text`n$body``````"; color = $Trust.Color }
-    }
-
-    $file = ''; $text = ''
-    if ($script:Report.AttachFullLog) {
-        $file = "$($script:ReportId)-system-check.txt"
-        $text = Get-BsmmSystemReportText -Results $Results -Trust $Trust -Seconds $Seconds
-    }
-    return (Send-BsmmWebhook -Payload @{ username = "$($script:Brand.Name) Anti-Cheat"; embeds = $embeds } -FileName $file -FileText $text)
 }
 
-# One message per match that is edited while the live monitor runs (a heartbeat staff can watch).
-function Get-BsmmLivePayload {
-    param([datetime]$Since, [string]$State, $Trust)
-    $elapsed = (Get-Date) - $Since
-    $c = $script:MonitorAlertCounts
-    $recent = @($script:MonitorLog | Where-Object { $_ -match '\[(FAIL|WARN)\]' } | Select-Object -Last 12)
-    $body = ''
-    foreach ($l in $recent) { $body += (Limit-BsmmText (Protect-BsmmText $l) 200) + "`n" }
-    if (-not $body) { $body = "No suspicious activity so far.`n" }
-    $player = $script:PlayerName; if (-not $player) { $player = 'not given' }
-    $color = $Trust.Color
-    if ($State -eq 'RUNNING') { $color = 0x7AA2F7 }
-    return @{
-        username = "$($script:Brand.Name) Anti-Cheat"
-        embeds = @(@{
-            title = "$($script:Brand.Name) $($script:Brand.Product) - Live monitor ($State)"
-            description = "Report ``$($script:ReportId)`` - Player ``$(Protect-BsmmText $player)```n**Trust score: $($Trust.Score)/100 - $($Trust.Label)**`n``````text`n$body``````"
-            color = $color
-            fields = @(
-                @{ name = 'Monitoring for'; value = ('{0:hh\:mm\:ss}' -f $elapsed); inline = $true },
-                @{ name = 'Alerts'; value = "$($c.FAIL) fail / $($c.WARN) warn / $($c.INFO) info"; inline = $true }
-            )
-            footer = @{ text = "Last update - if this stops updating before the match ends, the window was closed" }
-            timestamp = (Get-Date).ToUniversalTime().ToString('o')
-        })
+# Everything the relay needs to judge this PC. It works out the verdict; nothing is decided here.
+function Get-BsmmReportBody {
+    param([array]$Results, [int]$Seconds)
+    $admin = $false; try { $admin = [bool](Test-Admin) } catch {}
+    $facts = [ordered]@{}
+    foreach ($fact in (Get-BsmmSystemFacts).GetEnumerator()) { $facts[[string]$fact.Key] = Limit-BsmmText (Protect-BsmmText ([string]$fact.Value)) 200 }
+    $identity = Get-BsmmRobloxIdentity
+    $body = @{
+        v        = [string]$script:Brand.Version
+        seconds  = $Seconds
+        admin    = $admin
+        facts    = $facts
+        checks   = @(Get-BsmmReportChecks -Results $Results)
+        roblox   = @{ userId = [string]$identity.userId; accounts = @($identity.accounts); games = @($identity.games) }
+        pc       = [string](Get-BsmmPcFingerprint)
+        programs = @(Get-BsmmProgramRuns)
     }
+    $body.clock = Get-BsmmUnix      # taken last: the relay compares it with its own clock to correct program times
+    return $body
 }
 
 # =============================================================================
@@ -6402,7 +6756,8 @@ namespace BSMM
         }
 
         // Reads the newest maxBytes of the volume's change journal. Keeps records for files with one of the
-        // given extensions, folders with one of the given names, and the new name of any such file renamed.
+        // given extensions (an entry without a leading dot is a whole file name, e.g. "imgui.ini"), folders
+        // with one of the given names, and the new name of any such file renamed.
         public static List<UsnEntry> ReadUsn(string drive, long maxBytes, string[] exts, string[] dirNames, DateTime since, string skipPrefix, UsnInfo info)
         {
             var result = new List<UsnEntry>();
@@ -6459,7 +6814,7 @@ namespace BSMM
                             string ext = "";
                             int dot = name.LastIndexOf('.');
                             if (dot >= 0) ext = name.Substring(dot);
-                            bool keep = isDir ? dirSet.Contains(name) : extSet.Contains(ext);
+                            bool keep = isDir ? dirSet.Contains(name) : (extSet.Contains(ext) || extSet.Contains(name));
                             if (keep && (reason & 0x1000) != 0) renamed.Add(frn);
                             if (!keep && (reason & 0x2000) != 0 && renamed.Contains(frn)) keep = true;
                             if (keep && result.Count < 400000)
@@ -6482,13 +6837,88 @@ namespace BSMM
                 {
                     if (e.Time < since) continue;
                     e.Path = ResolveDir(h, e.ParentFrn, dirs, cache, root, 0) + "\\" + e.Name;
-                    if (!string.IsNullOrEmpty(skipPrefix) && e.Path.StartsWith(skipPrefix, StringComparison.OrdinalIgnoreCase) && !e.Name.EndsWith(".pf", StringComparison.OrdinalIgnoreCase)) continue;
+                    if (!string.IsNullOrEmpty(skipPrefix) && e.Path.StartsWith(skipPrefix, StringComparison.OrdinalIgnoreCase) && !e.Name.EndsWith(".pf", StringComparison.OrdinalIgnoreCase) && !extSet.Contains(e.Name)) continue;
                     kept.Add(e);
                 }
                 result = kept;
                 info.Ok = info.RecordsRead > 0 || info.Error == null;
             }
             return result;
+        }
+    }
+
+    public class PrefetchInfo
+    {
+        public string Exe;          // program name as Windows recorded it (upper case, at most 29 characters)
+        public string Path;         // full path from the file list, starting \VOLUME{...} or \DEVICE\..., or null
+        public DateTime[] Times;    // the last runs, newest first (up to 8)
+        public int RunCount;
+    }
+
+    public static class Timeline
+    {
+        [DllImport("ntdll.dll")] static extern int RtlGetCompressionWorkSpaceSize(ushort format, out uint bufferSize, out uint fragmentSize);
+        [DllImport("ntdll.dll")] static extern int RtlDecompressBufferEx(ushort format, byte[] output, int outputSize, byte[] input, int inputSize, out int finalSize, byte[] workSpace);
+
+        // Reads one prefetch file (Windows 8.1, 10 and 11): which program, how often and when it last ran.
+        // Returns null for a file it does not understand.
+        public static PrefetchInfo Prefetch(string file)
+        {
+            return Parse(File.ReadAllBytes(file));
+        }
+
+        public static PrefetchInfo Parse(byte[] raw)
+        {
+            if (raw == null || raw.Length < 16) return null;
+            byte[] data = raw;
+            if (raw[0] == 0x4D && raw[1] == 0x41 && raw[2] == 0x4D)        // "MAM": compressed, Windows 10 and later
+            {
+                ushort format = (ushort)(raw[3] & 0x0F);
+                int start = (raw[3] & 0x80) != 0 ? 12 : 8;                 // an optional checksum follows the size
+                int size = BitConverter.ToInt32(raw, 4);
+                if (size <= 0 || size > 64 * 1024 * 1024 || raw.Length <= start) return null;
+                uint bufferSize, fragmentSize;
+                if (RtlGetCompressionWorkSpaceSize(format, out bufferSize, out fragmentSize) != 0) return null;
+                byte[] input = new byte[raw.Length - start];
+                Buffer.BlockCopy(raw, start, input, 0, input.Length);
+                data = new byte[size];
+                int final;
+                if (RtlDecompressBufferEx(format, data, size, input, input.Length, out final, new byte[Math.Max(bufferSize, fragmentSize)]) != 0) return null;
+            }
+            if (data.Length < 0xD8 || data[4] != 0x53 || data[5] != 0x43 || data[6] != 0x43 || data[7] != 0x41) return null;   // "SCCA"
+            int version = BitConverter.ToInt32(data, 0);
+            if (version != 26 && version != 30 && version != 31) return null;
+
+            var info = new PrefetchInfo();
+            string exe = Encoding.Unicode.GetString(data, 0x10, 60);
+            int end = exe.IndexOf('\0');
+            info.Exe = end >= 0 ? exe.Substring(0, end) : exe;
+
+            var times = new List<DateTime>();
+            for (int i = 0; i < 8; i++)
+            {
+                long stamp = BitConverter.ToInt64(data, 0x80 + i * 8);
+                if (stamp <= 0) continue;
+                try { times.Add(DateTime.FromFileTime(stamp)); } catch { }
+            }
+            info.Times = times.ToArray();
+            // Newer Windows 10 and 11 builds moved the run count 8 bytes earlier; the header size tells them apart.
+            int countAt = (version == 26 || BitConverter.ToInt32(data, 0x54) == 304) ? 0xD0 : 0xC8;
+            info.RunCount = BitConverter.ToInt32(data, countAt);
+
+            int namesAt = BitConverter.ToInt32(data, 0x64), namesSize = BitConverter.ToInt32(data, 0x68);
+            if (info.Exe.Length > 0 && namesAt > 0 && namesSize > 0 && (long)namesAt + namesSize <= data.Length)
+            {
+                foreach (string name in Encoding.Unicode.GetString(data, namesAt, namesSize).Split('\0'))
+                {
+                    int slash = name.LastIndexOf('\\');
+                    if (slash < 0) continue;
+                    string leaf = name.Substring(slash + 1);
+                    bool same = info.Exe.Length >= 29 ? leaf.StartsWith(info.Exe, StringComparison.OrdinalIgnoreCase) : leaf.Equals(info.Exe, StringComparison.OrdinalIgnoreCase);
+                    if (same) { info.Path = name; break; }
+                }
+            }
+            return info;
         }
     }
 }
@@ -6521,7 +6951,7 @@ function Get-BsmmKeywordRegex {
     return $script:KeywordRegex
 }
 
-$script:KeywordIgnorePaths = '(?i)\\(BattlEye|EasyAntiCheat[^\\]*|Riot Vanguard|Microsoft Office|WindowsApps|Microsoft Visual Studio|Blitz\\blitz-deps|Overwolf|steamapps\\common|DriverStore|WinSxS)\\'
+$script:KeywordIgnorePaths = '(?i)\\(BattlEye|EasyAntiCheat[^\\]*|Riot Vanguard|Microsoft Office|WindowsApps|SystemApps|Microsoft Visual Studio|Blitz\\blitz-deps|Overwolf|steamapps\\common|DriverStore|WinSxS)\\'
 function Get-BsmmCheatKeywordFast {
     param([string]$Text)
     if (-not $Text) { return $null }
@@ -6710,7 +7140,9 @@ function Get-ChangeJournalAlerts {
     if (-not (Initialize-BsmmForensics)) { return @("WARNING: Forensic engine unavailable ($script:BsmmForensicsError)") }
 
     $info = New-Object BSMM.UsnInfo
-    $exts = @('.exe', '.dll', '.sys', '.lua', '.luau', '.pf', '.onnx', '.engine', '.pt', '.ahk', '.bat', '.ps1', '.asi')
+    $exts = @('.exe', '.dll', '.sys', '.lua', '.luau', '.pf', '.onnx', '.engine', '.pt', '.ahk', '.bat', '.ps1', '.asi', 'imgui.ini')
+    $script:JournalPrefetch = New-Object System.Collections.Generic.List[object]   # kept for the program timeline
+    $imgui = New-Object System.Collections.Generic.List[string]
     $entries = $null
     try { $entries = [BSMM.Forensics]::ReadUsn($env:SystemDrive, 256MB, [string[]]$exts, [string[]]@('autoexec'), (Get-Date).AddDays(-7), ($env:SystemRoot + '\'), $info) } catch {
         return @("WARNING: Could not read the change journal ($($_.Exception.Message))")
@@ -6759,7 +7191,18 @@ function Get-ChangeJournalAlerts {
             continue
         }
         $ext = ''; $dot = $e.Name.LastIndexOf('.'); if ($dot -ge 0) { $ext = $e.Name.Substring($dot).ToLower() }
-        if ($ext -eq '.pf') { if ($isDelete -and $e.Time -ge $logon) { $pfDeletes.Add($e.Time) }; continue }
+        if ($ext -eq '.pf') {
+            if ($isDelete) { if ($e.Time -ge $logon) { $pfDeletes.Add($e.Time) } }
+            elseif (($r -band 0x107) -ne 0) { $script:JournalPrefetch.Add([pscustomobject]@{ Name = $e.Name; Time = $e.Time }) }   # written = the program ran
+            continue
+        }
+        if ($e.Name -eq 'imgui.ini') {
+            # ImGui writes this next to the program that draws the menu; a cheat's copy outlives the cheat.
+            if (($isCreate -or $isDelete) -and $e.Path -notmatch $script:ImGuiIgnorePaths) {
+                $imgui.Add("$(if ($isDelete) { 'deleted' } else { 'created' }) $when -> $($e.Path)")
+            }
+            continue
+        }
         if ($ext -eq '.sys' -and $e.Path -match '(?i)\\(Temp|AppData)\\') {
             $k = [string]$e.Frn
             if ($isCreate) { $sysCreated[$k] = $e.Time }
@@ -6794,6 +7237,11 @@ function Get-ChangeJournalAlerts {
     foreach ($x in @($replaced | Select-Object -Unique -First 10)) { $alerts.Add("WARNING: Journal: program file overwritten in place since logon: $x") }
     foreach ($x in @($deleted | Select-Object -Unique -First 15)) { $alerts.Add("WARNING: Journal: deleted since logon: $x") }
     foreach ($x in @($models | Select-Object -Unique -First 5)) { $alerts.Add("WARNING: Journal: AI model file created (aimbots use these): $x") }
+    foreach ($x in @($imgui | Select-Object -Unique -First 10)) {
+        $lvl = 'WARNING'
+        if ($x -match $script:ImGuiHotPaths) { $lvl = 'FAILURE' }
+        $alerts.Add("${lvl}: Journal: ImGui menu settings file (imgui.ini) $x")
+    }
 
     $covers = 'unknown'
     if ($info.OldestRecord -gt [datetime]'2000-01-01') { $covers = Get-Date $info.OldestRecord -Format 'yyyy-MM-dd HH:mm' }
@@ -8161,7 +8609,7 @@ function Get-BsmmRobloxLogTailAlerts {
 
 $script:ProgressWidth = 28
 
-# "  ######......   54%  Checking Defender exclusions..."  redrawn in place
+# "  ######......   54%  Checking this PC..."  redrawn in place. The text never names the check being run.
 function Write-CheckProgress {
     param([int]$Done, [int]$Total, [string]$Text)
 
@@ -8200,92 +8648,8 @@ function Write-CheckProgress {
     }
 }
 
-function Write-ResultCell {
-    param($Result, [int]$NameWidth = 30, [switch]$NoNewline)
-    $name = [string]$Result.Name
-    if ($name.Length -gt $NameWidth) { $name = $name.Substring(0, $NameWidth - 3) + '...' }
-    $status = $Result.Summary.Status
-    Out-Badge $status -NoNewline
-    $nameTok = 'Body'; if ($status -eq 'FAIL' -or $status -eq 'WARN') { $nameTok = 'Text' }
-    Out-Seg ('  ' + $name.PadRight($NameWidth)) -Fg $nameTok -Bold:($status -eq 'FAIL') -NoNewline:$NoNewline
-}
-
-# The result grid, verdict panel and per-section details shown at the end of step 1.
-function Show-SystemCheckSummary {
-    param([array]$Results, [int]$Seconds)
-
-    $total = $Results.Count
-    $fail = @($Results | Where-Object { $_.Summary.Status -eq 'FAIL' }).Count
-    $warn = @($Results | Where-Object { $_.Summary.Status -eq 'WARN' }).Count
-    $clean = $total - $fail - $warn
-
-    Out-Seg ''
-    Out-Heading 'Results' ("$total checks $($script:G.Mid) ${Seconds}s")
-    Out-Seg ''
-    $nameW = 30
-    $cellW = 6 + 2 + $nameW
-    if ($script:UiWidth -ge ($cellW * 2 + 4)) {
-        $half = [int][Math]::Ceiling($total / 2)
-        for ($i = 0; $i -lt $half; $i++) {
-            Out-Seg '  ' -NoNewline
-            Write-ResultCell $Results[$i] -NameWidth $nameW -NoNewline
-            if ($i + $half -lt $total) {
-                Out-Seg '    ' -NoNewline
-                Write-ResultCell $Results[$i + $half] -NameWidth $nameW
-            } else {
-                Out-Seg ''
-            }
-        }
-    } else {
-        foreach ($r in $Results) { Out-Seg '  ' -NoNewline; Write-ResultCell $r -NameWidth $nameW }
-    }
-
-    # Verdict panel
-    $trustNow = Get-BsmmTrustScore -Results $Results
-    $vText = $trustNow.Label; $vTok = $trustNow.Token
-    $W = $script:UiWidth
-    $inner = $W - 4
-    $summaryText = "$fail failed  $($script:G.Mid)  $warn to review  $($script:G.Mid)  $clean clean"
-
-    Out-Seg ''
-    Out-Seg ('  ' + $script:G.TL + ($script:G.H * ($W - 2)) + $script:G.TR) -Fg $vTok
-    # line 1: big verdict chip + counts
-    Out-Seg ('  ' + $script:G.V + ' ') -Fg $vTok -NoNewline
-    $chip = " $vText "
-    if ($script:UseAnsi) { Out-Seg $chip -Fg 'Ink' -Bg $vTok -Bold -NoNewline } else { $chip = "[$vText]"; Out-Seg $chip -Fg $vTok -NoNewline }
-    $rest = '   ' + $summaryText
-    if (($chip.Length + $rest.Length) -gt $inner) { $rest = $rest.Substring(0, [Math]::Max(0, $inner - $chip.Length)) }
-    Out-Seg $rest.PadRight($inner - $chip.Length) -Fg 'Body' -NoNewline
-    Out-Seg (' ' + $script:G.V) -Fg $vTok
-    # line 2: stacked bar of fail / warn / clean
-    $cells = [Math]::Min(48, $inner - 14)
-    $fc = 0; $wc = 0
-    if ($total -gt 0) {
-        $fc = [int][Math]::Round($cells * $fail / $total); if ($fail -gt 0 -and $fc -lt 1) { $fc = 1 }
-        $wc = [int][Math]::Round($cells * $warn / $total); if ($warn -gt 0 -and $wc -lt 1) { $wc = 1 }
-    }
-    $pc = [Math]::Max(0, $cells - $fc - $wc)
-    $trust = Get-BsmmTrustScore -Results $Results
-    $pctText = "  TRUST $($trust.Score)/100"
-    Out-Seg ('  ' + $script:G.V + ' ') -Fg $vTok -NoNewline
-    Out-Seg ($script:G.Block * $fc) -Fg 'Fail' -NoNewline
-    Out-Seg ($script:G.Block * $wc) -Fg 'Warn' -NoNewline
-    Out-Seg ($script:G.Block * $pc) -Fg 'Pass' -NoNewline
-    Out-Seg $pctText.PadRight($inner - $cells) -Fg $trust.Token -Bold -NoNewline
-    Out-Seg (' ' + $script:G.V) -Fg $vTok
-    Out-Seg ('  ' + $script:G.BL + ($script:G.H * ($W - 2)) + $script:G.BR) -Fg $vTok
-
-    # Details: failures first, then warnings, then anything with extra context
-    $ordered = @($Results | Where-Object { $_.Summary.Status -eq 'FAIL' }) +
-               @($Results | Where-Object { $_.Summary.Status -eq 'WARN' }) +
-               @($Results | Where-Object { $_.Summary.Status -eq 'PASS' -and $_.Summary.Info -gt 0 })
-    if ($ordered.Count -gt 0) {
-        Out-Seg ''
-        Out-Heading 'Details'
-        foreach ($r in $ordered) { Write-Section $r.Name $r.Lines }
-    }
-}
-
+# Caption is not shown to the player (it would name the check); the relay reads the Name list from this
+# table to know which checks a complete report must contain.
 $script:SystemChecks = @(
     @{ Name = 'PowerShell Modules';           Caption = 'Loading PowerShell modules';         Run = { Initialize-BsmmModules } },
     @{ Name = 'CPU & GPU';                    Caption = 'Reading CPU and GPU';                Run = { Get-CpuGpuAlerts } },
@@ -8359,6 +8723,8 @@ $script:SystemChecks = @(
     @{ Name = 'Long-term History';            Caption = 'Reading Amcache, SRUM and Defender logs'; Run = { Get-LongTermHistoryAlerts } },
     @{ Name = 'USN Journal';                  Caption = 'Checking USN change journal';        Run = { Get-UsnJournalAlerts } },
     @{ Name = 'Change Journal Evidence';      Caption = 'Reading the file change journal';    Run = { Get-ChangeJournalAlerts } },
+    @{ Name = 'ImGui Traces';                 Caption = 'Looking for cheat menu settings files'; Run = { Get-ImGuiTraceAlerts } },
+    @{ Name = 'Roblox Account Data';          Caption = 'Checking Roblox logs and saved accounts'; Run = { Get-RobloxAccountDataAlerts } },
     @{ Name = 'Recycle Bin';                  Caption = 'Checking recently deleted files';    Run = { Get-RecycleBinAlerts } },
     @{ Name = 'System Clock';                 Caption = 'Checking for clock changes';         Run = { Get-ClockChangeAlerts } },
     @{ Name = 'Command History';              Caption = 'Scanning command history';           Run = { Get-CommandHistoryAlerts } },
@@ -8373,61 +8739,42 @@ $script:SystemCheckResults = @()
 $checkTotal = $script:SystemChecks.Count
 $checkDone = 0
 
-if ($script:Report.AskPlayerName) {
-    Write-StepHeader -Step 1
-    Out-Seg ''
-    Out-Seg '  ' -NoNewline
-    Out-Seg 'Roblox username' -Fg 'Text' -Bold -NoNewline
-    Out-Seg '  (shown on the recording and in the report)' -Fg 'Muted'
-    Out-Seg '  > ' -Fg 'Brand1' -NoNewline
-    $script:PlayerName = (([string](Read-Host)) -replace '[^A-Za-z0-9_\. -]', '').Trim()
-    if ($script:PlayerName.Length -gt 32) { $script:PlayerName = $script:PlayerName.Substring(0, 32) }
-}
-
 Write-StepHeader -Step 1
-if (Test-BsmmRelay) {
-    Out-TaggedText -Indent '  ' -Tag 'NOTE' -Text 'Results are sent to BSMM staff with this report ID. User names, the PC name and personal files are never sent.' -TextToken 'Muted'
-}
+Out-TaggedText -Indent '  ' -Tag 'NOTE' -Text 'Results go to BSMM staff under this report ID and are not shown here. User names, the PC name and personal files are never sent.' -TextToken 'Muted'
 if (-not (Test-Admin)) {
     Out-Seg ''
     Out-Card -Title 'Not running as administrator' -Accent 'Warn' -Lines @(
         'Several checks need admin rights and will be incomplete.',
-        'Close this window, right-click PowerShell, choose "Run as administrator" and start the check again.'
+        'Ask staff for a new command, right-click PowerShell, choose "Run as administrator" and paste it there.'
     )
 }
 Out-Seg ''
-Out-Heading 'Scanning' "$checkTotal checks"
+Out-Heading 'Scanning'
 Out-Seg ''
 $step1Start = Get-Date
 
+# What each check found is kept for the report only. The screen shows how far the scan is, nothing else.
 foreach ($check in $script:SystemChecks) {
-    Write-CheckProgress -Done $checkDone -Total $checkTotal -Text "$($check.Caption)..."
+    Write-CheckProgress -Done $checkDone -Total $checkTotal -Text 'Checking this PC...'
     $lines = @()
     try {
         $lines = @(& $check.Run)
     } catch {
         $lines = @("WARNING: Check crashed ($($_.Exception.Message))")
     }
-    $script:SystemCheckResults += @{ Name = $check.Name; Lines = $lines; Summary = (Get-AlertSetSummary -Lines $lines) }
+    $script:SystemCheckResults += @{ Name = $check.Name; Lines = @(Limit-BsmmSeverity -Check $check.Name -Lines $lines) }
     $checkDone++
 }
+Write-CheckProgress -Done $checkTotal -Total $checkTotal -Text 'Sending the report...'
 $step1Seconds = [int][math]::Round(((Get-Date) - $step1Start).TotalSeconds)
-Write-CheckProgress -Done $checkTotal -Total $checkTotal -Text "Done in ${step1Seconds}s"
+$reportSent = $false
+try { $reportSent = Send-BsmmSigned -Path '/v1/report' -Seq 0 -Body (Get-BsmmReportBody -Results $script:SystemCheckResults -Seconds $step1Seconds) } catch {}
+$script:Session.Key = ''      # the key works once
+Write-CheckProgress -Done $checkTotal -Total $checkTotal -Text 'Done'
 Out-Seg ''
-
-$failCount = @($script:SystemCheckResults | Where-Object { $_.Summary.Status -eq 'FAIL' }).Count
-$warnCount = @($script:SystemCheckResults | Where-Object { $_.Summary.Status -eq 'WARN' }).Count
-
-Show-SystemCheckSummary -Results $script:SystemCheckResults -Seconds $step1Seconds
-
-$script:SystemTrust = Get-BsmmTrustScore -Results $script:SystemCheckResults
-if (Test-BsmmRelay) {
-    Out-Seg ''
-    $sentId = $null
-    try { $sentId = Send-BsmmSystemReport -Results $script:SystemCheckResults -Trust $script:SystemTrust -Seconds $step1Seconds } catch {}
-    if ($sentId) { Out-TaggedText -Indent '  ' -Tag 'PASS' -Text "Report $($script:ReportId) sent to BSMM staff" }
-    else { Out-TaggedText -Indent '  ' -Tag 'WARN' -Text "Report $($script:ReportId) could not be sent (no internet?) - the recording is still valid" }
-}
+Out-Seg ''
+if ($reportSent) { Out-TaggedText -Indent '  ' -Tag 'PASS' -Text "Report $($script:ReportId) sent to BSMM staff" }
+else { Out-TaggedText -Indent '  ' -Tag 'WARN' -Text "Report $($script:ReportId) could not be sent. Tell staff: they will give you a new command." }
 
 Out-Seg ''
 Out-Rule
@@ -8461,11 +8808,10 @@ Out-Rule
 Out-Seg ''
 Out-Seg '  ' -NoNewline
 Out-Seg 'PC CHECK COMPLETE' -Fg 'Text' -Bold -NoNewline
-Out-Seg ("   TRUST $($script:SystemTrust.Score)/100  $($script:SystemTrust.Label)") -Fg $script:SystemTrust.Token -Bold -NoNewline
 Out-Seg "   report $($script:ReportId)" -Fg 'Muted'
 Out-Seg ''
 Out-Card -Title 'Done' -Lines @(
-    'Show this screen to BSMM staff and keep this window open until they have seen it.',
-    "Staff can find this check in Discord under report $($script:ReportId)."
+    "BSMM staff have your results under report $($script:ReportId).",
+    'Keep this window open until staff tell you that you can close it.'
 )
 Out-Seg ''
