@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { ADMIN, createRelay, report } from './harness.mjs';
+import { ADMIN, PS_AGENT, createRelay, report } from './harness.mjs';
 
 const flagCodes = (detail) => detail.flags.map((flag) => flag.code).sort();
 
@@ -91,6 +91,19 @@ test('a browser or link preview does not use up the code', async () => {
   const preview = await relay.call('GET', `/c/${check.code}`, { headers: { 'user-agent': 'Mozilla/5.0 (compatible; Discordbot/2.0)' } });
   assert.ok(!preview.text.includes('Key ='));
   assert.equal((await relay.download(check.code)).session.id, check.id);
+});
+
+test('the fixed start command asks for the code, then loads that check', async () => {
+  const relay = createRelay();
+  const start = await relay.call('GET', '/run', { headers: { 'user-agent': PS_AGENT } });
+  assert.equal(start.status, 200);
+  assert.match(start.text, /Read-Host/);
+  assert.ok(start.text.includes('irm "https://relay.test/c/$code" | iex'));
+  assert.ok(!/Key =|SystemChecks/.test(start.text), 'the start script holds no session and no checks');
+
+  const browser = await relay.call('GET', '/run', { headers: { 'user-agent': 'Mozilla/5.0 Chrome/130.0' } });
+  assert.ok(!browser.text.includes('Read-Host'));
+  assert.equal((await relay.call('POST', '/run')).status, 404);
 });
 
 test('an expired or unknown code serves no script', async () => {

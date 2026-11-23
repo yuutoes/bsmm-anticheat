@@ -85,7 +85,9 @@ POST /v1/checks        Authorization: Bearer <their key>
   "matches": [{ "id": "...", "started_at": <unix seconds>, "ended_at": <unix seconds> }] }
 ```
 
-and gets back the one-time `command` to give the player. All fields are optional.
+and gets back a one-time `code` to give the player. The player runs
+`irm https://<the relay>/run | iex`, which is the same for everyone, and pastes the code when it
+asks. All fields are optional.
 
 To see the keys or switch one off:
 
@@ -98,7 +100,7 @@ Invoke-RestMethod -Method Delete -Uri 'https://bsmm-relay.<your-name>.workers.de
 
 - A check can only be started with a valid API key. Keys are 256 random bits, cannot be guessed
   and can only be created with the admin secret.
-- A one-time command downloads the script once, within 10 minutes, and only to PowerShell.
+- A one-time code downloads the script once, within 10 minutes, and only to PowerShell.
 - Each run gets its own signing key. A report is accepted once, only if its signature matches, and
   only within 45 minutes of the download (8 hours for a live monitor).
 - The verdict is worked out by the relay, not by the player's PC. Reports that leave checks out,

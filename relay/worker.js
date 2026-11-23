@@ -19,6 +19,7 @@
 //   GET    /v1/checks         ?q= &verdict= &mode= &before= &limit=
 //   GET    /v1/checks/<id>    the full report
 // The player's PC:
+//   GET    /run               the command every player pastes: asks for their code, then loads /c/<code>
 //   GET    /c/<code>          the script, once, with this check's signing key inside
 //   POST   /v1/report         signed PC check result
 //   POST   /v1/live           signed live monitor update
@@ -120,9 +121,11 @@ async function route(request, env) {
   }
 
   const code = path.match(/^\/c\/([^/]+)$/);
-  const fromPc = (method === 'GET' && code) || (method === 'POST' && (path === '/v1/report' || path === '/v1/live'));
+  const start = path === '/run';
+  const fromPc = (method === 'GET' && (code || start)) || (method === 'POST' && (path === '/v1/report' || path === '/v1/live'));
   if (!fromPc) throw new Refused(404, 'not found');
   if (await limited(request, env)) throw new Refused(429, 'rate limited');
+  if (start) return startScript(request, url.origin);
   if (code) return serveScript(request, env, code[1], url.origin);
   return path === '/v1/report' ? fileReport(request, env) : liveUpdate(request, env);
 }
@@ -235,14 +238,28 @@ async function scriptSource(env, mode) {
 
 // The response is piped straight into PowerShell, so every outcome has to be a runnable script.
 function scriptMessage(message) {
-  return new Response(`Write-Host '${message}' -ForegroundColor Yellow\r\n`, { headers: { 'content-type': 'text/plain; charset=utf-8', 'cache-control': 'no-store' } });
+  return new Response(`Write-Host '${message}' -ForegroundColor Yellow\r\n`, { headers: SCRIPT_HEADERS });
+}
+
+const SCRIPT_HEADERS = { 'content-type': 'text/plain; charset=utf-8', 'cache-control': 'no-store' };
+const notPowerShell = (request) => (/powershell/i.test(request.headers.get('user-agent') || '')
+  ? null
+  : new Response('Paste the whole command into PowerShell. Opening this address in a browser does nothing.', { headers: { 'cache-control': 'no-store' } }));
+
+// The command every player pastes: it asks for their one-time code, then loads that check.
+// It is the same for everyone, so it holds no session and says nothing about the checks.
+function startScript(request, origin) {
+  const lines = [
+    "$code = ((Read-Host 'Paste the code BSMM staff gave you, then press Enter') -replace '[^A-Za-z0-9]', '').ToUpper()",
+    `if ($code) { irm "${origin}/c/$code" | iex } else { Write-Host 'No code entered. Run the command again when you have your code.' -ForegroundColor Yellow }`,
+  ];
+  return notPowerShell(request) || new Response(lines.join('\r\n') + '\r\n', { headers: SCRIPT_HEADERS });
 }
 
 async function serveScript(request, env, code, origin) {
   // Link previews and browsers must not use up the code: only PowerShell gets the script.
-  if (!/powershell/i.test(request.headers.get('user-agent') || '')) {
-    return new Response('Paste the whole command into PowerShell. Opening this address in a browser does nothing.', { headers: { 'cache-control': 'no-store' } });
-  }
+  const refused = notPowerShell(request);
+  if (refused) return refused;
   const invalid = 'This BSMM check code is invalid, expired or already used. Ask staff for a new one.';
   if (!CODE.test(code)) return scriptMessage(invalid);
 
@@ -264,7 +281,7 @@ async function serveScript(request, env, code, origin) {
     .bind(version, await sha256(source), JSON.stringify(expected), check.id).run();
 
   const session = `$global:BsmmSession = @{ Id = '${check.id}'; Key = '${check.key}'; Relay = '${origin}'; Mode = '${check.mode}' }\r\n`;
-  return new Response(session + source, { headers: { 'content-type': 'text/plain; charset=utf-8', 'cache-control': 'no-store' } });
+  return new Response(session + source, { headers: SCRIPT_HEADERS });
 }
 
 // ---------------------------------------------------------------------------------------------
