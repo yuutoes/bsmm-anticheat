@@ -26,7 +26,7 @@ $script:Brand = @{
     Name    = 'BSMM'
     Product = 'Anti-Cheat'
     Mode    = 'Live monitor'
-    Version = '1.3.0'
+    Version = '1.4.0'
     Website = ''
 }
 
@@ -3845,6 +3845,8 @@ function Get-CommandHistoryAlerts {
         }
     }
 
+    $alerts += @(Get-TypedHistoryAlerts)
+
     if (-not ($alerts | Where-Object { $_ -like 'FAILURE*' -or $_ -like 'WARNING*' })) {
         $alerts = @('SUCCESS: No anti-forensic commands in command history') + $alerts
     }
@@ -5686,6 +5688,8 @@ function Get-BsmmRobloxIdentity {
     }
 
     $games = New-Object System.Collections.Generic.List[object]
+    $kicks = New-Object System.Collections.Generic.List[object]
+    $spans = New-Object System.Collections.Generic.List[object]
     $logs = @()
     try {
         $logs = @(Get-ChildItem -LiteralPath (Join-Path $root 'logs') -File -Filter '*_Player_*_last.log' -ErrorAction Stop |
@@ -5695,6 +5699,8 @@ function Get-BsmmRobloxIdentity {
     foreach ($log in @($logs | Select-Object -First 40)) {
         $text = ''
         try { $text = Read-BsmmTextFile -Path $log.FullName } catch { continue }
+        $spans.Add(@{ Start = $log.CreationTime; End = $log.LastWriteTime })
+        foreach ($kick in @(Get-BsmmRobloxKicks -Text $text)) { $kicks.Add($kick) }
         foreach ($join in $script:RobloxJoinRegex.Matches($text)) {
             $at = [int64]0
             try { $at = Get-BsmmUnix ([datetime]::Parse($join.Groups[1].Value, [Globalization.CultureInfo]::InvariantCulture, $styles)) } catch {}
@@ -5719,6 +5725,8 @@ function Get-BsmmRobloxIdentity {
         userId     = $userId
         accounts   = @($accounts.Values | Sort-Object { $_.last } -Descending | Select-Object -First 40)
         games      = @($games | Sort-Object { $_.at } -Descending | Select-Object -First 12)
+        Kicks      = $kicks.ToArray()
+        Spans      = $spans.ToArray()
         LogCount   = $logs.Count
         NewestLog  = $newestLog
         HasStorage = $hasStorage
@@ -5956,6 +5964,7 @@ function Get-BsmmProgramSignature {
                         if ($rootThumbprint -and -not (Test-UserInstalledRootThumbprint -Thumbprint $rootThumbprint)) { $result.sig = 'signed' }
                     }
                     $result.signer = Limit-BsmmText (Get-BsmmSigner $sig) 60
+                    if ($result.sig -eq 'unsigned') { $result.hash = Get-BsmmProgramHash -Path $file }
                 }
             }
         } catch {}
@@ -5993,8 +6002,526 @@ function Get-BsmmProgramRuns {
     return @(foreach ($run in $kept) {
         $state = @{ sig = 'unknown'; signer = '' }
         if ($run.recent -and ($clock.Elapsed.TotalSeconds -lt 40 -or $script:ProgramSignatures.ContainsKey($run.path))) { $state = Get-BsmmProgramSignature -Path $run.path }
-        @{ path = (Limit-BsmmText (Protect-BsmmText $run.path) 300); at = $run.at; src = $run.src; sig = $state.sig; signer = $state.signer; runs = $run.runs }
+        $entry = @{ path = (Limit-BsmmText (Protect-BsmmText $run.path) 300); at = $run.at; src = $run.src; sig = $state.sig; signer = $state.signer; runs = $run.runs }
+        if ($state.hash) { $entry.hash = $state.hash }
+        $entry
     })
+}
+
+$script:ToolRules = @(
+    @{ Kind = 'emulator'; Label = 'BlueStacks';        Pattern = 'bluestacks|(^|\\)hd-?player|bstk(svc|drv)|msi app player' },
+    @{ Kind = 'emulator'; Label = 'LDPlayer';          Pattern = 'ldplayer|dnplayer|(^|\\)ld9?box|ldvbox' },
+    @{ Kind = 'emulator'; Label = 'MuMu Player';       Pattern = 'mumu ?player|mumuvm|nemuhead|netease\\mumu' },
+    @{ Kind = 'emulator'; Label = 'NoxPlayer';         Pattern = 'noxvm|nox ?player|bignox|(^|\\)nox(\.exe)?$' },
+    @{ Kind = 'emulator'; Label = 'MEmu';              Pattern = '(^|\\)memu(hyperv|headless|console|svc|play)?(\.exe)?$|microvirt|memu play' },
+    @{ Kind = 'emulator'; Label = 'GameLoop';          Pattern = 'gameloop|androidemulatore[nx]|aow_exe' },
+    @{ Kind = 'emulator'; Label = 'Android subsystem'; Pattern = 'windowssubsystemforandroid|wsaclient' },
+    @{ Kind = 'emulator'; Label = 'Android emulator';  Pattern = 'genymotion|koplayer|smartgaga|droid4x' },
+    @{ Kind = 'sandbox';  Label = 'Sandboxie';         Pattern = 'sandboxie|(^|\\)sbie(svc|ctrl|drv|ini)|(^|\\)sandman(\.exe)?$' },
+    @{ Kind = 'sandbox';  Label = 'Shade Sandbox';     Pattern = 'shade ?sandbox' },
+    @{ Kind = 'sandbox';  Label = 'BufferZone';        Pattern = 'bufferzone' },
+    @{ Kind = 'sandbox';  Label = 'Time Freeze';       Pattern = 'time ?freeze' },
+    @{ Kind = 'sandbox';  Label = 'Deep Freeze';       Pattern = 'deep ?freeze|(^|\\)dfserv|(^|\\)frzstate' },
+    @{ Kind = 'sandbox';  Label = 'Shadow Defender';   Pattern = 'shadow ?defender' },
+    @{ Kind = 'sandbox';  Label = 'Rollback Rx';       Pattern = 'rollback ?rx|reboot ?restore' },
+    @{ Kind = 'sandbox';  Label = 'Returnil';          Pattern = 'returnil' },
+    @{ Kind = 'cleaner';  Label = 'BleachBit';         Pattern = 'bleachbit' },
+    @{ Kind = 'cleaner';  Label = 'PrivaZer';          Pattern = 'privazer' },
+    @{ Kind = 'cleaner';  Label = 'trace cleaner';     Pattern = '(prefetch|usn|journal|trace|string|bam|shimcache) ?(cleaner|wiper|eraser)|pc ?check ?bypass' },
+    @{ Kind = 'ccleaner'; Label = 'CCleaner';          Pattern = 'ccleaner' },
+    @{ Kind = 'lag';      Label = 'lag switch';        Pattern = 'lag ?switch|(roblox|rbx) ?lag|lag ?macro|fake ?lag' },
+    @{ Kind = 'lag';      Label = 'NetLimiter';        Pattern = 'netlimiter|(^|\\)nlclientapp|(^|\\)nlsvc' },
+    @{ Kind = 'lag';      Label = 'NetBalancer';       Pattern = 'netbalancer' },
+    @{ Kind = 'lag';      Label = 'Clumsy';            Pattern = '(^|\\)clumsy' },
+    @{ Kind = 'lag';      Label = 'WinDivert';         Pattern = 'windivert' },
+    @{ Kind = 'lag';      Label = 'network cut tool';  Pattern = '(^|\\)netcut|tuxcut|selfishnet|wpe ?pro|packet ?editor' }
+)
+$script:ToolRegex = New-Object System.Text.RegularExpressions.Regex (('(?i)' + (($script:ToolRules | ForEach-Object { $_.Pattern }) -join '|')), [System.Text.RegularExpressions.RegexOptions]::Compiled)
+$script:ToolKindNames = @{ emulator = 'Android emulator'; sandbox = 'Sandbox / freeze tool'; cleaner = 'Trace cleaner'; ccleaner = 'Cleanup tool'; lag = 'Lag / packet tool' }
+$script:SoftwareInventory = $null
+
+function Get-BsmmToolMatch {
+    param([string]$Text)
+    if (-not $Text) { return $null }
+    $Text = $Text -replace '(?i)^[a-z]:\\users\\[^\\]+\\', ''
+    if (-not $script:ToolRegex.IsMatch($Text)) { return $null }
+    foreach ($rule in $script:ToolRules) { if ($Text -match "(?i)$($rule.Pattern)") { return $rule } }
+    return $null
+}
+
+function Add-BsmmToolItem {
+    param($Items, [string]$Source, [string]$Text, [string]$Shown, $Time = $null)
+    $rule = Get-BsmmToolMatch -Text $Text
+    if (-not $rule) { return }
+    if (-not $Shown) { $Shown = $Text }
+    $Items.Add([pscustomobject]@{ Kind = $rule.Kind; Label = $rule.Label; Source = $Source; Shown = $Shown; Time = $Time })
+}
+
+function Get-BsmmSoftwareInventory {
+    if ($null -ne $script:SoftwareInventory) { return $script:SoftwareInventory }
+    $items = New-Object System.Collections.Generic.List[object]
+
+    foreach ($p in @(Get-Process -ErrorAction SilentlyContinue)) {
+        $text = $null
+        try { $text = $p.Path } catch {}
+        if (-not $text) { $text = [string]$p.ProcessName }
+        Add-BsmmToolItem -Items $items -Source 'running' -Text $text
+    }
+
+    $services = Open-LocalMachineRegistryKey -SubKeyPath 'SYSTEM\CurrentControlSet\Services'
+    if ($services) {
+        try {
+            foreach ($name in $services.GetSubKeyNames()) {
+                $image = ''
+                try {
+                    $sub = $services.OpenSubKey($name)
+                    if ($sub) { $image = [string]$sub.GetValue('ImagePath'); $sub.Close() }
+                } catch {}
+                Add-BsmmToolItem -Items $items -Source 'installed' -Text $name -Shown "service $name"
+                Add-BsmmToolItem -Items $items -Source 'installed' -Text $image -Shown "service $name"
+            }
+        } finally { $services.Close() }
+    }
+
+    foreach ($root in @('HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall', 'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall', 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall')) {
+        try {
+            foreach ($app in @(Get-ItemProperty -Path "$root\*" -ErrorAction SilentlyContinue)) {
+                if ($app.DisplayName) { Add-BsmmToolItem -Items $items -Source 'installed' -Text ([string]$app.DisplayName) }
+            }
+        } catch {}
+    }
+
+    foreach ($root in @(@($env:ProgramFiles, ${env:ProgramFiles(x86)}, $env:ProgramData, $env:LOCALAPPDATA, $env:APPDATA) | Where-Object { $_ } | Select-Object -Unique)) {
+        try {
+            foreach ($dir in [IO.Directory]::GetDirectories($root)) { Add-BsmmToolItem -Items $items -Source 'installed' -Text ([IO.Path]::GetFileName($dir)) -Shown $dir }
+        } catch {}
+    }
+
+    $last = @{}
+    foreach ($run in @(Get-BsmmProgramHistory)) {
+        $path = [string]$run.Path
+        if (-not $last.ContainsKey($path) -or $run.Time -gt $last[$path]) { $last[$path] = $run.Time }
+    }
+    foreach ($path in $last.Keys) { Add-BsmmToolItem -Items $items -Source 'ran' -Text $path -Time $last[$path] }
+
+    $script:SoftwareInventory = $items
+    return $items
+}
+
+function Find-BsmmTools {
+    param([string[]]$Kind)
+    $found = @{}
+    foreach ($item in @(Get-BsmmSoftwareInventory)) {
+        if ($Kind -notcontains $item.Kind) { continue }
+        if (-not $found.ContainsKey($item.Label)) { $found[$item.Label] = @{ Label = $item.Label; Running = $false; LastRan = $null; Shown = $item.Shown } }
+        $tool = $found[$item.Label]
+        if ($item.Source -eq 'running') { $tool.Running = $true; $tool.Shown = $item.Shown }
+        if ($item.Time -and (-not $tool.LastRan -or $item.Time -gt $tool.LastRan)) {
+            $tool.LastRan = $item.Time
+            if (-not $tool.Running) { $tool.Shown = $item.Shown }
+        }
+    }
+    return @($found.Values | Sort-Object { $_.Label })
+}
+
+function Get-BsmmToolAlerts {
+    param([string]$Kind, [int]$Days)
+    $what = $script:ToolKindNames[$Kind]
+    $since = (Get-Date).AddDays(-$Days)
+    return @(foreach ($tool in @(Find-BsmmTools -Kind $Kind)) {
+        if ($tool.Running) { "WARNING: $what running ($($tool.Label)) -> $($tool.Shown)" }
+        elseif ($tool.LastRan -and $tool.LastRan -ge $since) { "WARNING: $what ran $(Get-Date $tool.LastRan -Format 'yyyy-MM-dd HH:mm') ($($tool.Label)) -> $($tool.Shown)" }
+        else { "INFO: $what installed but not run in the last $Days days ($($tool.Label))" }
+    })
+}
+
+function Get-LiveToolAlerts {
+    $alerts = @()
+    foreach ($p in @(Get-Process -ErrorAction SilentlyContinue)) {
+        $text = $null
+        try { $text = $p.Path } catch {}
+        if (-not $text) { $text = [string]$p.ProcessName }
+        $rule = Get-BsmmToolMatch -Text $text
+        if ($rule) { $alerts += "WARNING: $($script:ToolKindNames[$rule.Kind]) running ($($rule.Label)) -> $text" }
+    }
+    return @($alerts | Select-Object -Unique)
+}
+
+function Get-EmulatorAlerts {
+    $alerts = @(Get-BsmmToolAlerts -Kind 'emulator' -Days 30)
+    if ($alerts.Count -eq 0) { return @('SUCCESS: No Android emulator found') }
+    return $alerts
+}
+
+$script:RobloxKickRegex = New-Object System.Text.RegularExpressions.Regex ('(?im)^(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d(?:\.\d+)?Z),[^\r\n]*?(?:(unexpected client behaviou?r|(?:error code|reason)\s*:\s*268\b)|kicked from this experience\s*:\s*([^\r\n]{1,160}?)\s*(?:\(error code[^\r\n]*)?\r?$)')
+$script:RobloxKickCheatWords = '(?i)\b(exploit\w*|cheat\w*|hack\w*|inject\w*|executor|anti[- ]?cheat|speed ?hack\w*|fly ?hack\w*|noclip\w*|teleport ?hack\w*|tamper\w*|suspicious)\b'
+
+function Get-BsmmRobloxKicks {
+    param([string]$Text)
+    $kicks = New-Object System.Collections.Generic.List[object]
+    if (-not $Text) { return @() }
+    $ordinal = [StringComparison]::OrdinalIgnoreCase
+    $marks = @(': 268', ':268', 'kicked from this experience', 'unexpected client')
+    if (-not ($marks | Where-Object { $Text.IndexOf($_, $ordinal) -ge 0 } | Select-Object -First 1)) { return @() }
+    $styles = [Globalization.DateTimeStyles]::AssumeUniversal -bor [Globalization.DateTimeStyles]::AdjustToUniversal
+    $lastAt = @{}
+    foreach ($hit in $script:RobloxKickRegex.Matches($Text)) {
+        $at = [int64]0
+        try { $at = Get-BsmmUnix ([datetime]::Parse($hit.Groups[1].Value, [Globalization.CultureInfo]::InvariantCulture, $styles)) } catch { continue }
+        $kind = 'game'; $reason = ''
+        if ($hit.Groups[2].Success) { $kind = 'anticheat' } else { $reason = $hit.Groups[3].Value.Trim() }
+        $key = "$kind|$reason"
+        if ($lastAt.ContainsKey($key) -and ($at - $lastAt[$key]) -lt 120) { $lastAt[$key] = $at; continue }
+        $lastAt[$key] = $at
+        $kicks.Add(@{ At = $at; Kind = $kind; Reason = $reason; Cheat = ($kind -eq 'game' -and $reason -match $script:RobloxKickCheatWords) })
+    }
+    return $kicks.ToArray()
+}
+
+function Get-RobloxKickAlerts {
+    $alerts = @()
+    $epoch = [datetime]'1970-01-01'
+    $when = { param($kick) Get-Date $epoch.AddSeconds($kick.At).ToLocalTime() -Format 'yyyy-MM-dd HH:mm' }
+    $kicks = @((Get-BsmmRobloxIdentity).Kicks | Sort-Object { $_.At } -Descending)
+    $own = @($kicks | Where-Object { $_.Kind -eq 'anticheat' })
+    $cheat = @($kicks | Where-Object { $_.Cheat })
+    $other = @($kicks | Where-Object { $_.Kind -eq 'game' -and -not $_.Cheat })
+    if ($own.Count -gt 0) {
+        $alerts += "WARNING: Roblox's own anti-cheat kicked this PC out of a game (error 268, unexpected client behavior) - $($own.Count) time(s) in the kept logs, last $(& $when $own[0])"
+    }
+    foreach ($kick in @($cheat | Select-Object -First 4)) {
+        $alerts += "WARNING: A game kicked this player for cheating on $(& $when $kick) -> $(Limit-BsmmText $kick.Reason 120)"
+    }
+    if ($cheat.Count -gt 4) { $alerts += "WARNING: ... and $($cheat.Count - 4) more kicks for cheating" }
+    if ($other.Count -gt 0) { $alerts += "INFO: $($other.Count) other kick(s) by games in the kept logs, last $(& $when $other[0]) -> $(Limit-BsmmText $other[0].Reason 120)" }
+    if ($alerts.Count -eq 0) { return @('SUCCESS: No kicks by Roblox or by a game in the kept Roblox logs') }
+    return $alerts
+}
+
+function ConvertFrom-BsmmFirewallRule {
+    param([string]$Rule)
+    $fields = @{}
+    foreach ($part in ([string]$Rule).Split('|')) {
+        $cut = $part.IndexOf('=')
+        if ($cut -gt 0) { $fields[$part.Substring(0, $cut).ToLower()] = $part.Substring($cut + 1) }
+    }
+    return $fields
+}
+
+function Test-BsmmRobloxBlockRule {
+    param([string]$Rule)
+    if (-not $Rule -or $Rule.IndexOf('roblox', [StringComparison]::OrdinalIgnoreCase) -lt 0) { return $false }
+    $fields = ConvertFrom-BsmmFirewallRule -Rule $Rule
+    return ([string]$fields['action'] -eq 'Block' -and "$($fields['app'])|$($fields['name'])" -match '(?i)roblox')
+}
+
+function Get-BsmmRobloxBlockRules {
+    $found = @()
+    $key = Open-LocalMachineRegistryKey -SubKeyPath 'SYSTEM\CurrentControlSet\Services\SharedAccess\Parameters\FirewallPolicy\FirewallRules'
+    if (-not $key) { return $found }
+    try {
+        foreach ($name in $key.GetValueNames()) {
+            $rule = [string]$key.GetValue($name)
+            if (-not (Test-BsmmRobloxBlockRule -Rule $rule)) { continue }
+            $fields = ConvertFrom-BsmmFirewallRule -Rule $rule
+            $found += @{ Name = [string]$fields['name']; Active = ([string]$fields['active'] -eq 'TRUE') }
+        }
+    } catch {} finally { $key.Close() }
+    return $found
+}
+
+function Get-BsmmFirewallChanges {
+    param([datetime]$Since)
+    $kinds = @{ 2004 = 'add'; 2097 = 'add'; 2005 = 'change'; 2099 = 'change'; 2006 = 'delete'; 2052 = 'delete' }
+    $changes = New-Object System.Collections.Generic.List[object]
+    try {
+        $filter = @{ LogName = 'Microsoft-Windows-Windows Firewall With Advanced Security/Firewall'; Id = @($kinds.Keys); StartTime = $Since }
+        foreach ($entry in @(Get-WinEvent -FilterHashtable $filter -MaxEvents 5000 -ErrorAction Stop)) {
+            $values = @($entry.Properties | ForEach-Object { [string]$_.Value })
+            if ($values.Count -lt 2) { continue }
+            $kind = $kinds[[int]$entry.Id]
+            $app = ''; $block = $false
+            if ($kind -ne 'delete' -and $values.Count -ge 10) { $app = $values[3]; $block = ($values[9] -eq '2') }
+            $changes.Add(@{ Time = $entry.TimeCreated; Kind = $kind; RuleId = $values[0]; Name = $values[1]; App = $app; Block = $block })
+        }
+    } catch {}
+    return $changes.ToArray()
+}
+
+function Get-BsmmFirewallToggleAlerts {
+    param([object[]]$Changes)
+    $ordered = @($Changes | Sort-Object { $_.Time })
+    $rules = @{}
+    foreach ($change in $ordered) {
+        if ($change.Kind -ne 'delete' -and $change.Block -and "$($change.App)|$($change.Name)" -match '(?i)roblox') { $rules[[string]$change.RuleId] = [string]$change.Name }
+    }
+    if ($rules.Count -eq 0) { return @() }
+    $count = 0; $last = $null; $name = ''
+    foreach ($change in $ordered) {
+        $id = [string]$change.RuleId
+        if (-not $rules.ContainsKey($id) -or ($change.Kind -ne 'delete' -and -not $change.Block)) { continue }
+        $count++; $last = $change.Time; $name = $rules[$id]
+    }
+    $lastText = Get-Date $last -Format 'yyyy-MM-dd HH:mm:ss'
+    if ($count -ge 4) { return @("FAILURE: A firewall rule that blocks Roblox ('$name') was switched on and off - added, changed or removed $count times, last $lastText (this is how a lag switch works)") }
+    return @("WARNING: A firewall rule that blocks Roblox ('$name') was added, changed or removed $count time(s), last $lastText")
+}
+
+function Get-BsmmNetworkEvents {
+    param([datetime]$Since)
+    try {
+        $filter = @{ LogName = 'Microsoft-Windows-NetworkProfile/Operational'; Id = 10000, 10001; StartTime = $Since }
+        return @(foreach ($entry in @(Get-WinEvent -FilterHashtable $filter -MaxEvents 5000 -ErrorAction Stop)) {
+            $net = ''
+            if ($entry.Properties.Count -ge 3) { $net = ([string]$entry.Properties[2].Value -replace '[{}]', '').ToLower() }
+            @{ Time = $entry.TimeCreated; Up = ($entry.Id -eq 10000); Net = $net }
+        })
+    } catch { return @() }
+}
+
+function Get-BsmmConnectedNetworks {
+    try {
+        return @(Get-CimInstance -Namespace 'root/StandardCimv2' -ClassName MSFT_NetConnectionProfile -ErrorAction Stop |
+            ForEach-Object { ([string]$_.InstanceID -replace '[{}]', '').ToLower() })
+    } catch { return @() }
+}
+
+function Get-BsmmNetworkDrops {
+    param([object[]]$Events, [object[]]$Spans, [int]$MaxSeconds = 180, [string[]]$Connected = @())
+    $drops = New-Object System.Collections.Generic.List[object]
+    $ordered = @($Events | Sort-Object { $_.Time })
+    $up = New-Object 'System.Collections.Generic.HashSet[string]'
+    $known = New-Object 'System.Collections.Generic.HashSet[string]'
+    foreach ($item in $ordered) {
+        if ($known.Add([string]$item.Net) -and -not $item.Up) { [void]$up.Add([string]$item.Net) }
+    }
+    foreach ($net in @($Connected)) { if (-not $known.Contains($net)) { [void]$up.Add($net) } }
+
+    $lost = $null
+    foreach ($item in $ordered) {
+        if (-not $item.Up) {
+            [void]$up.Remove([string]$item.Net)
+            if ($up.Count -eq 0 -and -not $lost) { $lost = $item.Time }
+            continue
+        }
+        [void]$up.Add([string]$item.Net)
+        if (-not $lost) { continue }
+        $start = $lost
+        $lost = $null
+        $seconds = [int]($item.Time - $start).TotalSeconds
+        if ($seconds -gt $MaxSeconds) { continue }
+        foreach ($span in @($Spans)) {
+            if ($start -ge $span.Start -and $start -le $span.End) { $drops.Add(@{ At = $start; Seconds = $seconds }); break }
+        }
+    }
+    return $drops.ToArray()
+}
+
+function Get-LagSwitchAlerts {
+    $alerts = @()
+    foreach ($rule in @(Get-BsmmRobloxBlockRules)) {
+        if ($rule.Active) { $alerts += "FAILURE: A firewall rule is blocking Roblox right now ('$($rule.Name)') - this is how a lag switch cuts the connection" }
+        else { $alerts += "WARNING: A firewall rule that blocks Roblox is set up but switched off ('$($rule.Name)')" }
+    }
+    $alerts += @(Get-BsmmFirewallToggleAlerts -Changes @(Get-BsmmFirewallChanges -Since (Get-Date).AddDays(-30)))
+    $alerts += @(Get-BsmmToolAlerts -Kind 'lag' -Days 14)
+    $drops = @(Get-BsmmNetworkDrops -Events @(Get-BsmmNetworkEvents -Since (Get-Date).AddDays(-14)) -Spans @((Get-BsmmRobloxIdentity).Spans) -MaxSeconds 180 -Connected @(Get-BsmmConnectedNetworks) | Sort-Object { $_.At } -Descending)
+    if ($drops.Count -gt 0) {
+        $level = 'INFO'; if ($drops.Count -ge 3) { $level = 'WARNING' }
+        $alerts += "${level}: This PC lost every network and got it back within 3 minutes $($drops.Count) time(s) while Roblox was open in the last 14 days, last $(Get-Date $drops[0].At -Format 'yyyy-MM-dd HH:mm') for $($drops[0].Seconds)s"
+    }
+    if (-not ($alerts | Where-Object { $_ -like 'FAILURE*' -or $_ -like 'WARNING*' })) { $alerts = @('SUCCESS: No sign of a lag switch') + $alerts }
+    return @($alerts | Select-Object -Unique)
+}
+
+function Get-LiveLagAlerts {
+    param([datetime]$Since)
+    $alerts = @()
+    foreach ($rule in @(Get-BsmmRobloxBlockRules)) {
+        if ($rule.Active) { $alerts += "FAILURE: A firewall rule is blocking Roblox during the match ('$($rule.Name)')" }
+    }
+    foreach ($line in @(Get-BsmmFirewallToggleAlerts -Changes @(Get-BsmmFirewallChanges -Since $Since))) {
+        $alerts += 'FAILURE' + $line.Substring($line.IndexOf(':')) + ' - during the match'
+    }
+    $number = 0
+    foreach ($drop in @(Get-BsmmNetworkDrops -Events @(Get-BsmmNetworkEvents -Since $Since) -Spans @(@{ Start = $Since; End = (Get-Date) }) -MaxSeconds 180 -Connected @(Get-BsmmConnectedNetworks))) {
+        $number++
+        $alerts += "WARNING: Network drop $number during the match - gone for $($drop.Seconds)s at $(Get-Date $drop.At -Format 'HH:mm:ss')"
+    }
+    return $alerts
+}
+
+function Get-OtherAccountAlerts {
+    $alerts = @()
+    $mine = ''
+    try { $mine = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value } catch {}
+    $folders = @()
+    $key = Open-LocalMachineRegistryKey -SubKeyPath 'SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList'
+    if ($key) {
+        try {
+            foreach ($sid in $key.GetSubKeyNames()) {
+                if ($sid -notmatch '^S-1-5-21-[\d-]+$' -or $sid -eq $mine) { continue }
+                $sub = $key.OpenSubKey($sid)
+                if (-not $sub) { continue }
+                $folder = [Environment]::ExpandEnvironmentVariables([string]$sub.GetValue('ProfileImagePath')).TrimEnd('\')
+                $sub.Close()
+                if ($folder -and $folder -ne $env:USERPROFILE -and [IO.Directory]::Exists($folder)) { $folders += $folder }
+            }
+        } catch {} finally { $key.Close() }
+    }
+    if ($folders.Count -eq 0) { return @('SUCCESS: This is the only Windows account on this PC') }
+    foreach ($folder in $folders) { $alerts += @(Get-BsmmProfileAlerts -Folder $folder) }
+    return @($alerts | Select-Object -Unique)
+}
+
+function Get-BsmmProfileAlerts {
+    param([string]$Folder)
+    $alerts = @()
+    try { [void][IO.Directory]::GetDirectories($Folder) } catch {
+        return @("INFO: Another Windows account on this PC could not be read (run as administrator) -> $Folder")
+    }
+    $used = 'unknown'
+    try {
+        $stamp = [IO.File]::GetLastWriteTime((Join-Path $Folder 'NTUSER.DAT'))
+        if ($stamp.Year -gt 2000) { $used = Get-Date $stamp -Format 'yyyy-MM-dd' }
+    } catch {}
+    $logs = @()
+    try { $logs = @([IO.Directory]::GetFiles((Join-Path $Folder 'AppData\Local\Roblox\logs'), '*_Player_*_last.log')) } catch {}
+    if ($logs.Count -gt 0) {
+        $newest = @($logs | ForEach-Object { [IO.File]::GetLastWriteTime($_) } | Sort-Object -Descending)[0]
+        $level = 'INFO'; if ($newest -ge (Get-Date).AddDays(-30)) { $level = 'WARNING' }
+        $alerts += "${level}: Another Windows account on this PC played Roblox, last on $(Get-Date $newest -Format 'yyyy-MM-dd HH:mm') ($($logs.Count) game logs kept) -> $Folder"
+    } else {
+        $alerts += "INFO: Another Windows account on this PC, last used $used, has no Roblox game logs -> $Folder"
+    }
+    foreach ($part in @('Desktop', 'Downloads', 'Documents', 'AppData\Local', 'AppData\Roaming')) {
+        $entries = @()
+        try { $entries = @([IO.Directory]::GetFileSystemEntries((Join-Path $Folder $part))) } catch {}
+        foreach ($entry in $entries) {
+            $kw = Get-MatchedCheatKeyword -Text ([IO.Path]::GetFileName($entry))
+            if ($kw -and $alerts.Count -lt 10) { $alerts += "FAILURE: [$kw] in another Windows account on this PC -> $entry" }
+        }
+    }
+    return $alerts
+}
+
+function Get-SandboxCleanerAlerts {
+    $alerts = @(Get-BsmmToolAlerts -Kind 'sandbox' -Days 30)
+    $alerts += @(Get-BsmmToolAlerts -Kind 'cleaner' -Days 14)
+    $alerts += @(Get-BsmmToolAlerts -Kind 'ccleaner' -Days 2)
+
+    $box = Join-Path $env:SystemDrive 'Sandbox'
+    if ([IO.Directory]::Exists($box)) {
+        $alerts += "WARNING: A sandbox container folder exists (programs run inside it leave their files there) -> $box"
+        $queue = New-Object System.Collections.Generic.Queue[object]
+        $queue.Enqueue(@{ Path = $box; Depth = 0 })
+        $looked = 0; $hits = 0
+        while ($queue.Count -gt 0 -and $looked -lt 5000 -and $hits -lt 8) {
+            $dir = $queue.Dequeue()
+            $entries = @()
+            try { $entries = @([IO.Directory]::GetFileSystemEntries($dir.Path)) } catch {}
+            foreach ($entry in $entries) {
+                $looked++
+                $kw = Get-MatchedCheatKeyword -Text ([IO.Path]::GetFileName($entry))
+                if ($kw) { $hits++; $alerts += "FAILURE: [$kw] inside a sandbox container -> $entry" }
+                elseif ($dir.Depth -lt 6 -and [IO.Directory]::Exists($entry)) { $queue.Enqueue(@{ Path = $entry; Depth = $dir.Depth + 1 }) }
+            }
+        }
+    }
+    if (-not ($alerts | Where-Object { $_ -like 'FAILURE*' -or $_ -like 'WARNING*' })) { $alerts = @('SUCCESS: No sandbox, freeze or trace-cleaning tool in use') + $alerts }
+    return @($alerts | Select-Object -Unique)
+}
+
+function Get-BsmmTypedCommandAlerts {
+    param([object[]]$Entries)
+    $alerts = @()
+    foreach ($entry in @($Entries)) {
+        $text = ([string]$entry.Text -replace '\s+', ' ').Trim()
+        if (-not $text) { continue }
+        $shown = Limit-BsmmText $text 140
+        $rule = $script:AntiForensicCommandPatterns | Where-Object { $text -match "(?i)$($_.Pattern)" } | Select-Object -First 1
+        if ($rule) { $alerts += "$($rule.Level): $($rule.Label) in $($entry.Source) -> $shown"; continue }
+        $kw = Get-MatchedCheatKeyword -Text $text
+        if ($kw) { $alerts += "WARNING: $($entry.Source) [$kw] -> $shown" }
+    }
+    return @($alerts | Select-Object -Unique)
+}
+
+function Get-TypedHistoryAlerts {
+    $entries = @()
+    $sources = @(
+        @{ Name = 'Run box'; Key = 'Software\Microsoft\Windows\CurrentVersion\Explorer\RunMRU' },
+        @{ Name = 'Explorer address bar'; Key = 'Software\Microsoft\Windows\CurrentVersion\Explorer\TypedPaths' }
+    )
+    foreach ($source in $sources) {
+        try {
+            $key = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey($source.Key)
+            if (-not $key) { continue }
+            foreach ($name in $key.GetValueNames()) {
+                if ($name -ne 'MRUList') { $entries += @{ Source = $source.Name; Text = ([string]$key.GetValue($name) -replace '\\1$', '') } }
+            }
+            $key.Close()
+        } catch {}
+    }
+    return @(Get-BsmmTypedCommandAlerts -Entries $entries)
+}
+
+function ConvertFrom-BsmmShimCache {
+    param([byte[]]$Bytes)
+    $entries = New-Object System.Collections.Generic.List[object]
+    if (-not $Bytes -or $Bytes.Length -lt 64) { return @() }
+    $offset = [BitConverter]::ToInt32($Bytes, 0)
+    if ($offset -ne 0x30 -and $offset -ne 0x34) { return @() }
+    while ($offset + 14 -le $Bytes.Length -and $entries.Count -lt 4096) {
+        if ($Bytes[$offset] -ne 0x31 -or $Bytes[$offset + 1] -ne 0x30 -or $Bytes[$offset + 2] -ne 0x74 -or $Bytes[$offset + 3] -ne 0x73) { break }
+        $size = [BitConverter]::ToInt32($Bytes, $offset + 8)
+        $length = [int][BitConverter]::ToUInt16($Bytes, $offset + 12)
+        $next = $offset + 12 + $size
+        if ($size -lt 10 -or $next -gt $Bytes.Length -or ($length + 10) -gt $size) { break }
+        $path = [Text.Encoding]::Unicode.GetString($Bytes, $offset + 14, $length) -replace '^\\\?\?\\', ''
+        $modified = $null
+        $stamp = [BitConverter]::ToInt64($Bytes, $offset + 14 + $length)
+        if ($stamp -gt 0) { try { $modified = [datetime]::FromFileTime($stamp) } catch {} }
+        $entries.Add(@{ Path = $path; Modified = $modified })
+        $offset = $next
+    }
+    return $entries.ToArray()
+}
+
+function Get-ShimCacheAlerts {
+    $alerts = @()
+    $bytes = $null
+    try { $bytes = [byte[]](Get-ItemPropertyValue -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\AppCompatCache' -Name AppCompatCache -ErrorAction Stop) } catch { return @() }
+    $folders = @{}
+    foreach ($entry in @(ConvertFrom-BsmmShimCache -Bytes $bytes)) {
+        if ($entry.Path -notmatch '^[A-Za-z]:\\') { continue }
+        $kw = Get-BsmmCheatKeywordFast -Text $entry.Path
+        if (-not $kw) { continue }
+        $folder = [string](Split-Path -Path $entry.Path -Parent)
+        if ($folders.ContainsKey($folder)) { continue }
+        $folders[$folder] = $true
+        $state = 'still on disk'
+        if (-not [IO.File]::Exists($entry.Path)) { $state = 'deleted since' }
+        $alerts += "FAILURE: Windows compatibility cache [$kw] program was on this PC, $state -> $($entry.Path)"
+        if ($alerts.Count -ge 15) { break }
+    }
+    return @($alerts | Select-Object -Unique)
+}
+
+$script:ProgramHashBudget = @{ Files = 0; Clock = (New-Object System.Diagnostics.Stopwatch) }
+function Get-BsmmProgramHash {
+    param([string]$Path)
+    $budget = $script:ProgramHashBudget
+    if ($budget.Files -ge 150 -or $budget.Clock.Elapsed.TotalSeconds -gt 25) { return '' }
+    try {
+        $info = New-Object System.IO.FileInfo $Path
+        if (-not $info.Exists -or $info.Length -le 0 -or $info.Length -gt 96MB) { return '' }
+        $budget.Files++
+        $stream = [IO.File]::Open($Path, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::ReadWrite)
+        $sha = [System.Security.Cryptography.SHA256]::Create()
+        $budget.Clock.Start()
+        try { return (ConvertTo-BsmmHex $sha.ComputeHash($stream)) } finally { $budget.Clock.Stop(); $sha.Dispose(); $stream.Dispose() }
+    } catch { return '' }
 }
 
 $script:ImGuiIgnorePaths = '(?i)\\(steamapps|Program Files( \(x86\))?|WindowsApps|Epic Games|Riot Games)\\'
@@ -8627,7 +9154,7 @@ $script:SystemChecks = @(
 
     @{ Name = 'Prefetch Health';              Caption = 'Checking prefetch';                  Run = { Get-PrefetchHealthAlerts } },
     @{ Name = 'Artifact Cross-Check';         Caption = 'Cross-checking BAM vs prefetch';     Run = { Get-ArtifactCrossCheckAlerts } },
-    @{ Name = 'Program Launch Traces';        Caption = 'Reading Windows launch logs';        Run = { @(Get-PcaLaunchAlerts; Get-UserAssistAlerts; Get-RegistryTraceAlerts; Get-BamDeletedAlerts) } },
+    @{ Name = 'Program Launch Traces';        Caption = 'Reading Windows launch logs';        Run = { @(Get-PcaLaunchAlerts; Get-UserAssistAlerts; Get-RegistryTraceAlerts; Get-BamDeletedAlerts; Get-ShimCacheAlerts) } },
     @{ Name = 'USN Journal';                  Caption = 'Checking USN change journal';        Run = { Get-UsnJournalAlerts } },
     @{ Name = 'Recycle Bin';                  Caption = 'Checking recently deleted files';    Run = { Get-RecycleBinAlerts } },
     @{ Name = 'System Clock';                 Caption = 'Checking for clock changes';         Run = { Get-ClockChangeAlerts } },
@@ -8739,7 +9266,7 @@ foreach ($name in $script:MonitoredServices) {
 $script:LastRobloxBuildAnnounced = $null
 
 Initialize-BsmmMonitorBaseline
-foreach ($__scan in @({ Get-InjectedCodeAlerts }, { Get-RunningFingerprintAlerts }, { Get-LoggingTamperAlerts }, { Get-LoggingTamperExtraAlerts }, { Get-HypervisorDmaAlerts }, { Get-SecurityPolicyAlerts }, { Get-ScriptIntegrityAlerts }, { Get-KernelIntegrityAlerts }, { Get-RobloxBridgeAlerts }, { Get-RobloxTamperAlerts }, { Get-InputFilterAlerts }, { Get-ImGuiTraceAlerts })) {
+foreach ($__scan in @({ Get-InjectedCodeAlerts }, { Get-RunningFingerprintAlerts }, { Get-LoggingTamperAlerts }, { Get-LoggingTamperExtraAlerts }, { Get-HypervisorDmaAlerts }, { Get-SecurityPolicyAlerts }, { Get-ScriptIntegrityAlerts }, { Get-KernelIntegrityAlerts }, { Get-RobloxBridgeAlerts }, { Get-RobloxTamperAlerts }, { Get-InputFilterAlerts }, { Get-ImGuiTraceAlerts }, { Get-RobloxKickAlerts }, { Get-EmulatorAlerts }, { Get-LagSwitchAlerts }, { Get-OtherAccountAlerts }, { Get-SandboxCleanerAlerts }, { Get-TypedHistoryAlerts }, { Get-ShimCacheAlerts })) {
     try {
         foreach ($__l in @(& $__scan)) {
             if ($__l -like 'FAILURE*' -or $__l -like 'WARNING*') { Write-MonitorAlertOnce -Category 'deep' -Message $__l }
@@ -9049,6 +9576,9 @@ while ($true) {
             foreach ($line in (Get-MacroToolAlerts)) {
                 if ($line -like 'SUCCESS*') { continue }
                 Write-MonitorAlertOnce -Category 'macro' -Message $line
+            }
+            foreach ($line in @(Get-LiveToolAlerts) + @(Get-LiveLagAlerts -Since $monitoringStart)) {
+                Write-MonitorAlertOnce -Category 'deep' -Message $line
             }
             foreach ($e in (Get-RecycleBinEntries -Since $monitoringStart)) {
                 $kw = Get-MatchedCheatKeyword -Text $e.Path

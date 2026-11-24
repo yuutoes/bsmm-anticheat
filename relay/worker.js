@@ -54,6 +54,10 @@ const CLOCK_TOLERANCE = 120; // seconds the PC clock may be off before its times
 const PROGRAM_SOURCES = ['running', 'prefetch', 'bam', 'launch', 'exit', 'userassist', 'journal'];
 const LAST_RUN_SOURCES = ['launch', 'userassist']; // one entry per program that stays once written, so a missing one was removed
 const SIGNATURES = ['signed', 'unsigned', 'missing', 'unknown'];
+const FILE_HASH = /^[0-9a-f]{64}$/;
+const MAX_HASHES = 90; // D1 allows 100 bound values in one statement
+const FLAGGED_FAILS = 2;    // a PC whose own scan failed this many checks counts as flagged when programs are compared
+const SHARED_MARGIN = 0.25; // how much more common than usual a program must be on flagged PCs to be held against anyone
 const WEIGHTS = { fail: 18, failCap: 60, warn: 4, warnCap: 28, notAdmin: 10, liveFail: 10, liveWarn: 3, liveCap: 40 };
 const LABELS = [
   { below: 40, label: 'HIGH RISK', color: 0xfb4d6d },
@@ -76,7 +80,17 @@ const SCHEMA = [
   'CREATE INDEX IF NOT EXISTS checks_tenant_time ON checks (tenant_id, created_at DESC, id DESC)',
   'CREATE INDEX IF NOT EXISTS checks_tenant_pc ON checks (tenant_id, pc_hash)',
   'CREATE INDEX IF NOT EXISTS checks_tenant_player ON checks (tenant_id, roblox_id)',
+  `CREATE TABLE IF NOT EXISTS program_sightings (
+     tenant_id INTEGER NOT NULL, hash TEXT NOT NULL, check_id TEXT NOT NULL, seen_at INTEGER NOT NULL,
+     PRIMARY KEY (tenant_id, hash, check_id))`,
 ];
+
+const prepared = new WeakSet();
+async function ensureSchema(env) {
+  if (prepared.has(env.DB)) return;
+  await env.DB.batch(SCHEMA.map((sql) => env.DB.prepare(sql)));
+  prepared.add(env.DB);
+}
 
 class Refused extends Error {
   constructor(status, message) { super(message); this.status = status; }
@@ -103,7 +117,7 @@ async function route(request, env) {
 
   if (path.startsWith('/admin/')) {
     await requireAdmin(request, env);
-    await env.DB.batch(SCHEMA.map((sql) => env.DB.prepare(sql)));
+    await ensureSchema(env);
     const id = path.match(/^\/admin\/keys\/(\d{1,9})$/);
     if (method === 'POST' && path === '/admin/keys') return createKey(request, env);
     if (method === 'GET' && path === '/admin/keys') return listKeys(env);
@@ -409,7 +423,10 @@ function cleanReport(body) {
     const at = stamp(item.at);
     if (!path || !at || !PROGRAM_SOURCES.includes(item.src)) continue;
     const key = `${item.src}|${at}|${path.toLowerCase()}`;
-    if (!programs.has(key)) programs.set(key, { path, name: path.split(/[\\/]/).pop(), at, src: item.src, sig: SIGNATURES.includes(item.sig) ? item.sig : 'unknown', signer: text(item.signer, 60), runs: whole(item.runs, 1_000_000) });
+    if (programs.has(key)) continue;
+    const run = { path, name: path.split(/[\\/]/).pop(), at, src: item.src, sig: SIGNATURES.includes(item.sig) ? item.sig : 'unknown', signer: text(item.signer, 60), runs: whole(item.runs, 1_000_000) };
+    if (FILE_HASH.test(item.hash)) run.hash = item.hash;
+    programs.set(key, run);
   }
   const runs = [...programs.values()].sort((a, b) => b.at - a.at);
 
@@ -504,6 +521,7 @@ async function assemble(env, check, report, { now, ip }) {
   }
 
   const programs = await programActivity(env, check, report, now, flag);
+  await sharedPrograms(env, check, report, now, flag);
 
   return {
     programs,
@@ -583,6 +601,51 @@ async function programActivity(env, check, report, now, flag) {
   }
 
   return { skew_seconds: shift, runs, matches };
+}
+
+// Programs nobody has named as a cheat still give themselves away by the company they keep: an unsigned
+// program is fingerprinted by the script, and one that mostly turns up on flagged PCs is itself flagged,
+// whatever it is called. A PC counts as flagged only for what its own scan found, never for a flag raised
+// here, so this cannot feed on itself. A program is held against a player only when it is clearly more
+// common on flagged PCs than flagged PCs are in the league, so a league that mostly checks suspects does
+// not end up blaming whatever launcher they all use.
+async function sharedPrograms(env, check, report, now, flag) {
+  const mine = new Map(report.programs.filter((run) => run.hash).map((run) => [run.hash, run.name]));
+  if (!mine.size) return;
+  const hashes = [...mine.keys()].slice(0, MAX_HASHES);
+  await ensureSchema(env);
+  await env.DB.prepare('DELETE FROM program_sightings WHERE tenant_id = ? AND seen_at < ?').bind(check.tenant_id, now - RETENTION).run();
+
+  const [league, { results }] = await Promise.all([
+    env.DB.prepare('SELECT COUNT(*) AS checks, COALESCE(SUM(failed >= ?), 0) AS flagged FROM checks WHERE tenant_id = ? AND id != ? AND reported_at IS NOT NULL')
+      .bind(FLAGGED_FAILS, check.tenant_id, check.id).first(),
+    env.DB.prepare(
+      `SELECT s.hash, c.id, c.pc_hash, c.failed FROM program_sightings s JOIN checks c ON c.id = s.check_id
+        WHERE s.tenant_id = ? AND s.check_id != ? AND s.hash IN (${hashes.map(() => '?').join(', ')})`,
+    ).bind(check.tenant_id, check.id, ...hashes).all(),
+  ]);
+  const usual = league.checks ? league.flagged / league.checks : 0;
+
+  // One entry per other PC, flagged if any of its checks was.
+  const seen = new Map();
+  for (const row of results) {
+    if (report.pc && row.pc_hash === report.pc) continue;
+    const pcs = seen.get(row.hash) || new Map();
+    const pc = row.pc_hash || row.id;
+    pcs.set(pc, pcs.get(pc) || row.failed >= FLAGGED_FAILS);
+    seen.set(row.hash, pcs);
+  }
+  const shared = [...seen].map(([hash, pcs]) => ({ name: mine.get(hash), pcs: pcs.size, flagged: [...pcs.values()].filter(Boolean).length }))
+    .map((entry) => ({ ...entry, share: entry.flagged / entry.pcs }))
+    .filter((entry) => entry.flagged >= 2 && entry.share >= Math.max(0.5, usual + SHARED_MARGIN))
+    .sort((a, b) => b.flagged - a.flagged);
+  if (shared.length) {
+    // Two flagged PCs is worth a look. Three, with at most one clean PC in four, counts against the player.
+    const level = shared.some((entry) => entry.flagged >= 3 && entry.share >= 0.75) ? 'FAIL' : 'WARN';
+    flag(level, 'shared_program', `Programs without a trusted signature that mostly turn up on flagged PCs: ${shared.slice(0, 5).map((entry) => `${entry.name} (${plural(entry.pcs, 'other PC')}, ${entry.flagged} flagged)`).join(', ')}${shared.length > 5 ? ` and ${shared.length - 5} more` : ''}.`);
+  }
+
+  await env.DB.batch(hashes.map((hash) => env.DB.prepare('INSERT OR IGNORE INTO program_sightings (tenant_id, hash, check_id, seen_at) VALUES (?, ?, ?, ?)').bind(check.tenant_id, hash, check.id, now)));
 }
 
 function verdictOf(view) {

@@ -490,6 +490,117 @@ test('Discord shows when programs ran, as times that count up on their own', asy
   assert.ok(file.text.includes('C:\\Program Files\\Discord\\Discord.exe'), 'the log lists everything');
 });
 
+// ---------------------------------------------------------------- programs shared between PCs
+
+const hashOf = (letter) => letter.repeat(64);
+const pcOf = (n) => String(n).padStart(64, '0');
+const flaggedChecks = [
+  { name: 'Alpha', lines: ['FAILURE: one'] },
+  { name: 'Beta', lines: ['FAILURE: two'] },
+  { name: 'Gamma', lines: ['FAILURE: three'] },
+];
+// A check of its own PC and player that ran the given programs; `flagged` gives it findings of its own.
+const pcReport = (relay, key, n, programs, flagged = false) => reported(relay, key, { roblox_id: String(3000 + n) }, {
+  pc: pcOf(n),
+  roblox: { userId: String(3000 + n), accounts: [{ id: String(3000 + n), sources: ['logs'] }], games: [] },
+  clock: unix(),
+  programs,
+  ...(flagged ? { checks: flaggedChecks } : {}),
+});
+// The league's ordinary players: clean PCs running something everyone has.
+const cleanPcs = async (relay, key, from, count) => {
+  for (let n = from; n < from + count; n++) await pcReport(relay, key, n, [ran('C:\\Tools\\rgb.exe', 900, { hash: hashOf('9') })]);
+};
+
+test('an unsigned program that mostly turns up on flagged PCs is flagged without knowing its name', async () => {
+  const relay = createRelay();
+  const { key } = await relay.tenant();
+  const tool = (name) => ran(`C:\\Users\\kid\\Downloads\\${name}`, 500, { hash: hashOf('c') });
+  await cleanPcs(relay, key, 50, 5);
+
+  const first = await pcReport(relay, key, 1, [tool('helper.exe')], true);
+  assert.equal(first.detail.verdict.label, 'SUSPICIOUS');
+  assert.deepEqual(flagCodes(first.detail), [], 'the first PC to show a program has nothing to compare with');
+  const second = await pcReport(relay, key, 2, [tool('helper.exe')], true);
+  assert.deepEqual(flagCodes(second.detail), [], 'one flagged PC is not a pattern');
+
+  const third = await pcReport(relay, key, 3, [tool('renamed.exe')]);
+  assert.deepEqual(flagCodes(third.detail), ['shared_program']);
+  const warn = third.detail.flags[0];
+  assert.equal(warn.level, 'WARN');
+  assert.match(warn.text, /renamed\.exe \(2 other PCs, 2 flagged\)/, 'matched by fingerprint, shown under the name on this PC');
+  assert.equal(third.detail.verdict.label, 'TRUSTED', 'a warning alone does not flag the PC that got it');
+
+  await pcReport(relay, key, 4, [tool('helper.exe')], true);
+  const fifth = await pcReport(relay, key, 5, [tool('again.exe')]);
+  const fail = fifth.detail.flags.find((flag) => flag.code === 'shared_program');
+  assert.equal(fail.level, 'FAIL');
+  assert.match(fail.text, /again\.exe \(4 other PCs, 3 flagged\)/);
+  assert.equal(fifth.detail.programs.runs[0].hash, hashOf('c'), 'the fingerprint is kept with the run');
+});
+
+test('a program that trusted PCs also run is not held against anyone', async () => {
+  const relay = createRelay();
+  const { key } = await relay.tenant();
+  const common = ran('C:\\Tools\\rgb.exe', 500, { hash: hashOf('d') });
+  await pcReport(relay, key, 1, [common], true);
+  await pcReport(relay, key, 2, [common], true);
+  for (const n of [3, 4, 5]) await pcReport(relay, key, n, [common]);
+  const { detail } = await pcReport(relay, key, 6, [common]);
+  assert.deepEqual(flagCodes(detail), [], '2 flagged PCs out of 5 is not a pattern');
+});
+
+test('in a league where most checked PCs are flagged, sharing a program with them means nothing', async () => {
+  const relay = createRelay();
+  const { key } = await relay.tenant();
+  const launcher = ran('C:\\Tools\\launcher.exe', 500, { hash: hashOf('a') });
+  for (const n of [1, 2, 3, 4]) await pcReport(relay, key, n, [launcher], true);
+  const { detail } = await pcReport(relay, key, 5, [launcher]);
+  assert.deepEqual(flagCodes(detail), [], 'the program is no more common on flagged PCs than any PC is flagged');
+});
+
+test('a flag for a shared program never makes its own evidence', async () => {
+  const relay = createRelay();
+  const { key } = await relay.tenant();
+  const tool = ran('C:\\Temp\\t.exe', 500, { hash: hashOf('b') });
+  await cleanPcs(relay, key, 50, 8);
+  for (const n of [1, 2, 3]) await pcReport(relay, key, n, [tool], true);
+  // These PCs have nothing against them except the program itself.
+  for (const n of [4, 5, 6]) {
+    const { detail } = await pcReport(relay, key, n, [tool]);
+    assert.equal(detail.flags.find((flag) => flag.code === 'shared_program').text.match(/(\d+) flagged/)[1], '3', 'only PCs with findings of their own count as flagged');
+  }
+});
+
+test('the same PC checked twice, other leagues and malformed fingerprints do not count', async () => {
+  const relay = createRelay();
+  const a = await relay.tenant('League A');
+  const b = await relay.tenant('League B');
+  const tool = ran('C:\\Temp\\x.exe', 500, { hash: hashOf('e') });
+
+  await pcReport(relay, a.key, 1, [tool], true);
+  const again = await pcReport(relay, a.key, 1, [tool], true);
+  assert.ok(!flagCodes(again.detail).includes('shared_program'), 'a PC is not compared with its own earlier checks');
+
+  const other = await pcReport(relay, b.key, 2, [tool]);
+  assert.deepEqual(flagCodes(other.detail), [], 'leagues never see each other');
+
+  const bad = await pcReport(relay, a.key, 3, [ran('C:\\Temp\\y.exe', 500, { hash: 'not-a-hash' }), ran('C:\\Temp\\z.exe', 400)]);
+  assert.ok(bad.detail.programs.runs.every((run) => !('hash' in run)), 'a fingerprint is kept only when it is a SHA-256');
+  assert.deepEqual(flagCodes(bad.detail), []);
+});
+
+test('fingerprints are forgotten when they are older than the reports they came from', async () => {
+  const relay = createRelay();
+  const { key } = await relay.tenant();
+  const tool = ran('C:\\Temp\\x.exe', 500, { hash: hashOf('f') });
+  await pcReport(relay, key, 1, [tool], true);
+  relay.sqlite.prepare('UPDATE program_sightings SET seen_at = seen_at - ?').run(91 * 86_400_000);
+  const { detail } = await pcReport(relay, key, 2, [tool]);
+  assert.deepEqual(flagCodes(detail), []);
+  assert.equal(relay.sql('SELECT COUNT(*) AS n FROM program_sightings')[0].n, 1, 'only the new sighting is left');
+});
+
 // ---------------------------------------------------------------- reading reports
 
 test('a key only sees its own checks', async () => {
