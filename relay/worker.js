@@ -56,6 +56,7 @@ const LAST_RUN_SOURCES = ['launch', 'userassist']; // one entry per program that
 const SIGNATURES = ['signed', 'unsigned', 'missing', 'unknown'];
 const FILE_HASH = /^[0-9a-f]{64}$/;
 const MAX_HASHES = 90; // D1 allows 100 bound values in one statement
+const MAX_LOADED = 40; // files found loaded inside other programs, per report
 const FLAGGED_FAILS = 2;    // a PC whose own scan failed this many checks counts as flagged when programs are compared
 const SHARED_MARGIN = 0.25; // how much more common than usual a program must be on flagged PCs to be held against anyone
 const WEIGHTS = { fail: 18, failCap: 60, warn: 4, warnCap: 28, notAdmin: 10, liveFail: 10, liveWarn: 3, liveCap: 40 };
@@ -359,6 +360,8 @@ async function liveUpdate(request, env) {
   if (!view) view = await assemble(env, check, cleanReport(body), { now, ip: clientIp(request) });
   view.live = live;
   view.verdict = verdictOf(view);
+  // Files loaded during the match are kept for comparison with other PCs, like those a PC check finds.
+  await recordSightings(env, check, cleanLoaded(body.loaded).map((file) => file.hash), now);
 
   const message = liveMessage(view, check);
   let messageId = check.message_id;
@@ -432,6 +435,7 @@ function cleanReport(body) {
 
   return {
     clock: stamp(body.clock),
+    loaded: cleanLoaded(body.loaded),
     programs: runs.slice(0, MAX_PROGRAMS),
     programsComplete: runs.length <= MAX_PROGRAMS,
     version: text(body.v, 16),
@@ -444,6 +448,17 @@ function cleanReport(body) {
     games,
     pc: /^[0-9a-f]{64}$/.test(String(body.pc || '')) ? String(body.pc) : null,
   };
+}
+
+// Files the script found loaded inside other programs: the name to show, the program it was in and its fingerprint.
+function cleanLoaded(value) {
+  const loaded = new Map();
+  for (const item of list(value, MAX_LOADED)) {
+    const path = text(item && item.path, 300);
+    if (!path || !FILE_HASH.test(item.hash)) continue;
+    loaded.set(item.hash, { name: path.split(/[\\/]/).pop(), host: text(item.host, 60), hash: item.hash });
+  }
+  return [...loaded.values()];
 }
 
 function cleanLive(body, state) {
@@ -610,7 +625,10 @@ async function programActivity(env, check, report, now, flag) {
 // common on flagged PCs than flagged PCs are in the league, so a league that mostly checks suspects does
 // not end up blaming whatever launcher they all use.
 async function sharedPrograms(env, check, report, now, flag) {
-  const mine = new Map(report.programs.filter((run) => run.hash).map((run) => [run.hash, run.name]));
+  const mine = new Map([
+    ...report.programs.filter((run) => run.hash).map((run) => [run.hash, run.name]),
+    ...report.loaded.map((file) => [file.hash, file.host ? `${file.name} in ${file.host}` : file.name]),
+  ]);
   if (!mine.size) return;
   const hashes = [...mine.keys()].slice(0, MAX_HASHES);
   await ensureSchema(env);
@@ -645,6 +663,12 @@ async function sharedPrograms(env, check, report, now, flag) {
     flag(level, 'shared_program', `Programs without a trusted signature that mostly turn up on flagged PCs: ${shared.slice(0, 5).map((entry) => `${entry.name} (${plural(entry.pcs, 'other PC')}, ${entry.flagged} flagged)`).join(', ')}${shared.length > 5 ? ` and ${shared.length - 5} more` : ''}.`);
   }
 
+  await recordSightings(env, check, hashes, now);
+}
+
+async function recordSightings(env, check, hashes, now) {
+  if (!hashes.length) return;
+  await ensureSchema(env);
   await env.DB.batch(hashes.map((hash) => env.DB.prepare('INSERT OR IGNORE INTO program_sightings (tenant_id, hash, check_id, seen_at) VALUES (?, ?, ?, ?)').bind(check.tenant_id, hash, check.id, now)));
 }
 

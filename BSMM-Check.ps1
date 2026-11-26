@@ -26,7 +26,7 @@ $script:Brand = @{
     Name    = 'BSMM'
     Product = 'Anti-Cheat'
     Mode    = 'PC check'
-    Version = '1.4.0'
+    Version = '1.4.1'
     Website = ''
 }
 
@@ -1496,14 +1496,7 @@ function Get-StreamingProcessIntegrityAlerts {
                     if ($path.StartsWith($sysRoot, [System.StringComparison]::OrdinalIgnoreCase)) { continue }
                     if (-not $scannedModules.Add($path)) { continue }
 
-                    $isSigned = $false
-                    try {
-                        $cert = [System.Security.Cryptography.X509Certificates.X509Certificate]::CreateFromSignedFile($path)
-                        if ($cert) { $isSigned = $true }
-                    } catch {
-                        $sig = Microsoft.PowerShell.Security\Get-AuthenticodeSignature -LiteralPath $path -ErrorAction SilentlyContinue
-                        if ($sig -and $sig.Status -eq 'Valid') { $isSigned = $true }
-                    }
+                    $isSigned = (Get-BsmmFileTrust -Path $path).State -eq 'signed'
 
                     if (-not $isSigned) {
                         $entropy = Get-FileEntropy -FilePath $path
@@ -6694,6 +6687,7 @@ function Get-BsmmReportBody {
         roblox   = @{ userId = [string]$identity.userId; accounts = @($identity.accounts); games = @($identity.games) }
         pc       = [string](Get-BsmmPcFingerprint)
         programs = @(Get-BsmmProgramRuns)
+        loaded   = @($script:LoadedReport)
     }
     $body.clock = Get-BsmmUnix
     return $body
@@ -6734,7 +6728,6 @@ namespace BSMM
         public long RecordsRead;
     }
 
-    // Aho-Corasick automaton over bytes. Every needle is searched as ASCII and as UTF-16LE.
     public class Matcher
     {
         private int[] delta;
@@ -6856,7 +6849,7 @@ namespace BSMM
 
         static bool Readable(uint protect)
         {
-            if ((protect & 0x100) != 0 || (protect & 0x01) != 0) return false;   // GUARD / NOACCESS
+            if ((protect & 0x100) != 0 || (protect & 0x01) != 0) return false;
             return (protect & 0xEE) != 0;
         }
 
@@ -6901,7 +6894,6 @@ namespace BSMM
             finally { CloseHandle(h); }
         }
 
-        // ---- path strings -----------------------------------------------------------------------
         static readonly Regex PathRe = new Regex(
             @"(?:[A-Za-z]:|\\Device\\HarddiskVolume\d{1,3})\\(?:[^\\/:*?""<>|\x00-\x1f]{1,120}\\){0,24}[^\\/:*?""<>|\x00-\x1f]{1,120}?\.(?:exe|dll|sys|bat|cmd|ps1|lua|luau|ahk|jar|scr|py)(?![A-Za-z0-9])",
             RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
@@ -6974,7 +6966,6 @@ namespace BSMM
             }
         }
 
-        // Executable paths and DPS "!!name!timestamp" records found in a process's private/mapped memory.
         public static string[] ProcessPaths(int pid, long maxBytes, int maxResults, out string error)
         {
             var found = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
@@ -6984,7 +6975,6 @@ namespace BSMM
             return arr;
         }
 
-        // Same for a file on disk (copied databases, logs).
         public static string[] FilePaths(string path, long maxBytes, int maxResults)
         {
             var found = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
@@ -7000,7 +6990,6 @@ namespace BSMM
             return arr;
         }
 
-        // ---- fingerprints -------------------------------------------------------------------------
         public static ulong FileNeedles(string path, Matcher m, long maxBytes)
         {
             ulong hits = 0;
@@ -7079,7 +7068,6 @@ namespace BSMM
             return list.ToArray();
         }
 
-        // ---- registry app hive (Amcache copy) --------------------------------------------------------
         public static int LastHiveError;
         public static RegistryKey LoadAppHive(string file)
         {
@@ -7089,7 +7077,6 @@ namespace BSMM
             return RegistryKey.FromHandle(new SafeRegistryHandle(h, true));
         }
 
-        // ---- USN change journal ------------------------------------------------------------------------
         class DirInfo { public string Name; public ulong Parent; }
 
         static string PathById(SafeFileHandle vol, ulong frn)
@@ -7126,9 +7113,6 @@ namespace BSMM
             return path;
         }
 
-        // Reads the newest maxBytes of the volume's change journal. Keeps records for files with one of the
-        // given extensions (an entry without a leading dot is a whole file name, e.g. "imgui.ini"), folders
-        // with one of the given names, and the new name of any such file renamed.
         public static List<UsnEntry> ReadUsn(string drive, long maxBytes, string[] exts, string[] dirNames, DateTime since, string skipPrefix, UsnInfo info)
         {
             var result = new List<UsnEntry>();
@@ -7220,9 +7204,9 @@ namespace BSMM
 
     public class PrefetchInfo
     {
-        public string Exe;          // program name as Windows recorded it (upper case, at most 29 characters)
-        public string Path;         // full path from the file list, starting \VOLUME{...} or \DEVICE\..., or null
-        public DateTime[] Times;    // the last runs, newest first (up to 8)
+        public string Exe;
+        public string Path;
+        public DateTime[] Times;
         public int RunCount;
     }
 
@@ -7231,8 +7215,6 @@ namespace BSMM
         [DllImport("ntdll.dll")] static extern int RtlGetCompressionWorkSpaceSize(ushort format, out uint bufferSize, out uint fragmentSize);
         [DllImport("ntdll.dll")] static extern int RtlDecompressBufferEx(ushort format, byte[] output, int outputSize, byte[] input, int inputSize, out int finalSize, byte[] workSpace);
 
-        // Reads one prefetch file (Windows 8.1, 10 and 11): which program, how often and when it last ran.
-        // Returns null for a file it does not understand.
         public static PrefetchInfo Prefetch(string file)
         {
             return Parse(File.ReadAllBytes(file));
@@ -7242,10 +7224,10 @@ namespace BSMM
         {
             if (raw == null || raw.Length < 16) return null;
             byte[] data = raw;
-            if (raw[0] == 0x4D && raw[1] == 0x41 && raw[2] == 0x4D)        // "MAM": compressed, Windows 10 and later
+            if (raw[0] == 0x4D && raw[1] == 0x41 && raw[2] == 0x4D)
             {
                 ushort format = (ushort)(raw[3] & 0x0F);
-                int start = (raw[3] & 0x80) != 0 ? 12 : 8;                 // an optional checksum follows the size
+                int start = (raw[3] & 0x80) != 0 ? 12 : 8;
                 int size = BitConverter.ToInt32(raw, 4);
                 if (size <= 0 || size > 64 * 1024 * 1024 || raw.Length <= start) return null;
                 uint bufferSize, fragmentSize;
@@ -7256,7 +7238,7 @@ namespace BSMM
                 int final;
                 if (RtlDecompressBufferEx(format, data, size, input, input.Length, out final, new byte[Math.Max(bufferSize, fragmentSize)]) != 0) return null;
             }
-            if (data.Length < 0xD8 || data[4] != 0x53 || data[5] != 0x43 || data[6] != 0x43 || data[7] != 0x41) return null;   // "SCCA"
+            if (data.Length < 0xD8 || data[4] != 0x53 || data[5] != 0x43 || data[6] != 0x43 || data[7] != 0x41) return null;
             int version = BitConverter.ToInt32(data, 0);
             if (version != 26 && version != 30 && version != 31) return null;
 
@@ -7273,7 +7255,6 @@ namespace BSMM
                 try { times.Add(DateTime.FromFileTime(stamp)); } catch { }
             }
             info.Times = times.ToArray();
-            // Newer Windows 10 and 11 builds moved the run count 8 bytes earlier; the header size tells them apart.
             int countAt = (version == 26 || BitConverter.ToInt32(data, 0x54) == 304) ? 0xD0 : 0xC8;
             info.RunCount = BitConverter.ToInt32(data, countAt);
 
@@ -8092,8 +8073,10 @@ namespace BSMM
         }
         [DllImport("wintrust.dll", CharSet = CharSet.Unicode)]
         static extern int WinVerifyTrust(IntPtr hwnd, ref Guid action, ref WINTRUST_DATA data);
+        [DllImport("psapi.dll", SetLastError = true)] static extern bool EnumProcessModulesEx(IntPtr h, [Out] IntPtr[] modules, int size, out int needed, uint filter);
+        [DllImport("psapi.dll", CharSet = CharSet.Unicode, SetLastError = true)] static extern uint GetMappedFileNameW(IntPtr h, IntPtr address, System.Text.StringBuilder name, uint size);
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)] static extern bool QueryFullProcessImageNameW(IntPtr h, uint flags, System.Text.StringBuilder name, ref uint size);
 
-        // 0 = valid. Embedded signatures only; no revocation / network lookups, so it is fast.
         public static int VerifyFile(string path)
         {
             var fi = new WINTRUST_FILE_INFO();
@@ -8140,7 +8123,7 @@ namespace BSMM
         static string CompareHeaders(byte[] mem, int memLen, byte[] disk, int diskLen)
         {
             int pd = PeOffset(disk, diskLen);
-            if (pd < 0) return null;                       // file is not a normal PE: nothing to compare
+            if (pd < 0) return null;
             int pm = PeOffset(mem, memLen);
             if (pm < 0) return "PE header missing in memory";
             uint tsM = BitConverter.ToUInt32(mem, pm + 8), tsD = BitConverter.ToUInt32(disk, pd + 8);
@@ -8236,7 +8219,33 @@ namespace BSMM
             return r;
         }
 
-        // Alternate data streams other than the file's main content ("name|size").
+        public static string[] LoadedFiles(int pid)
+        {
+            var files = new List<string>();
+            IntPtr h = OpenProcess(0x0410, false, pid);
+            if (h == IntPtr.Zero) return files.ToArray();
+            try
+            {
+                var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                var name = new System.Text.StringBuilder(1024);
+                uint size = 1024;
+                if (!QueryFullProcessImageNameW(h, 1, name, ref size)) return files.ToArray();
+                seen.Add(name.ToString());
+                files.Add(name.ToString());
+                var modules = new IntPtr[4096];
+                int needed;
+                if (!EnumProcessModulesEx(h, modules, modules.Length * IntPtr.Size, out needed, 3)) return files.ToArray();
+                int count = Math.Min(needed / IntPtr.Size, modules.Length);
+                for (int i = 0; i < count; i++)
+                {
+                    if (GetMappedFileNameW(h, modules[i], name, 1024) > 0 && seen.Add(name.ToString())) files.Add(name.ToString());
+                }
+            }
+            catch { }
+            finally { CloseHandle(h); }
+            return files.ToArray();
+        }
+
         public static string[] Streams(string path)
         {
             var list = new List<string>();
@@ -8252,7 +8261,6 @@ namespace BSMM
             return list.ToArray();
         }
 
-        // True when the stream starts with an executable header.
         public static bool StreamIsExecutable(string path, string streamName)
         {
             using (SafeFileHandle h = CreateFile(path + streamName, 0x80000000, 7, IntPtr.Zero, 3, 0, IntPtr.Zero))
@@ -8374,7 +8382,7 @@ function Get-SignatureForgeryAlerts {
 
 $script:InjectSkipNames = '^(?i)(Roblox.*|System|Idle|Registry|Secure System|Memory Compression|MsMpEng|NisSrv|MpDefenderCoreService|csrss|smss|wininit|services|lsass|.*Iso|vmmem.*)$'
 function Get-InjectedCodeAlerts {
-    param([int[]]$OnlyPids = @(), [switch]$NoModules)
+    param([int[]]$OnlyPids = @())
     if (-not (Initialize-BsmmInspect)) { return @("WARNING: Process inspector unavailable ($script:BsmmInspectError)") }
     try { [System.Diagnostics.Process]::EnterDebugMode() } catch {}
     $alerts = New-Object System.Collections.Generic.List[string]
@@ -8406,23 +8414,219 @@ function Get-InjectedCodeAlerts {
                 }
             } catch {}
         }
-
-        if (-not $NoModules -and $path -and (Get-CachedSignatureStatus -Path $path) -eq 'Valid') {
-            $mods = @()
-            try { $mods = @($p.Modules | ForEach-Object { $_.FileName }) } catch {}
-            foreach ($m in $mods) {
-                if (-not $m -or $m -notmatch '(?i)\\(Users|ProgramData)\\' -or $m -match '(?i)\\AppData\\Local\\Microsoft\\') { continue }
-                if ((Get-CachedSignatureStatus -Path $m) -ne 'Valid') {
-                    $alerts.Add("WARNING: Unsigned DLL from a user folder loaded into signed program $($p.ProcessName) -> $m")
-                }
-            }
-        }
     }
     $alerts.Add("INFO: Inspected $inspected running programs")
     if (-not ($alerts | Where-Object { $_ -like 'FAILURE*' -or $_ -like 'WARNING*' })) {
         $alerts.Insert(0, 'SUCCESS: No hollowed programs, hidden code or injected threads found')
     }
     return @($alerts | Select-Object -Unique -First 30)
+}
+
+$script:FileTrust = @{}
+$script:CertRoots = @{}
+function Get-BsmmFileTrust {
+    param([string]$Path)
+    if ($script:FileTrust.ContainsKey($Path)) { return $script:FileTrust[$Path] }
+    $trust = @{ State = 'unsigned'; Signer = '' }
+    $sig = Get-BsmmSignature -Path $Path
+    if ($sig -and $sig.SignerCertificate) {
+        $trust.Signer = Get-BsmmSigner $sig
+        if ([string]$sig.Status -eq 'HashMismatch') { $trust.State = 'forged' }
+        elseif ([string]$sig.Status -eq 'Valid') {
+            $thumbprint = [string]$sig.SignerCertificate.Thumbprint
+            if (-not $script:CertRoots.ContainsKey($thumbprint)) { $script:CertRoots[$thumbprint] = Get-SignatureRootThumbprint -Certificate $sig.SignerCertificate }
+            if (-not (Test-UserInstalledRootThumbprint -Thumbprint $script:CertRoots[$thumbprint])) { $trust.State = 'signed' }
+        }
+    }
+    $script:FileTrust[$Path] = $trust
+    return $trust
+}
+
+function Get-BsmmFileZone {
+    param([string]$Path)
+    if ($Path.StartsWith($env:SystemRoot + '\', [StringComparison]::OrdinalIgnoreCase)) { return 'windows' }
+    foreach ($root in @($env:ProgramFiles, ${env:ProgramFiles(x86)}, $env:ProgramW6432)) {
+        if ($root -and $Path.StartsWith($root + '\', [StringComparison]::OrdinalIgnoreCase)) { return 'programs' }
+    }
+    return 'user'
+}
+
+$script:LoadSystemUnsigned = '(?i)\\assembly\\NativeImages_[^\\]+\\'
+function Get-BsmmLoadKind {
+    param([string]$File, [string]$HostPath, $Trust, $HostTrust)
+    if (-not $File -or -not $HostPath -or $File -ieq $HostPath) { return '' }
+    $zone = Get-BsmmFileZone -Path $File
+    if ($zone -eq 'programs') { return '' }
+    if ($zone -eq 'windows') {
+        if ($Trust.State -eq 'signed' -or $File -match $script:LoadSystemUnsigned) { return '' }
+    } else {
+        if ($File.StartsWith([IO.Path]::GetDirectoryName($HostPath) + '\', [StringComparison]::OrdinalIgnoreCase)) { return '' }
+        if ($Trust.State -eq 'signed') {
+            if ($Trust.Signer -match '^(?i)Microsoft ' -or ($HostTrust.Signer -and $Trust.Signer -eq $HostTrust.Signer)) { return '' }
+            return 'other'
+        }
+    }
+    return [string]$Trust.State
+}
+
+function Get-BsmmLoadedFiles {
+    $list = New-Object System.Collections.Generic.List[object]
+    if (-not (Initialize-BsmmInspect)) { return $list }
+    try { [System.Diagnostics.Process]::EnterDebugMode() } catch {}
+    $volumes = Get-BsmmVolumeMap
+    $paths = @{}
+    foreach ($p in @(Get-Process -ErrorAction SilentlyContinue)) {
+        if ($p.Id -le 4 -or $p.Id -eq $PID -or $p.ProcessName -match $script:InjectSkipNames) { continue }
+        $raw = @()
+        try { $raw = @([BSMM.Inspect]::LoadedFiles($p.Id)) } catch {}
+        if ($raw.Count -eq 0) { continue }
+        $files = @(foreach ($device in $raw) {
+            if (-not $paths.ContainsKey($device)) {
+                $paths[$device] = ConvertTo-BsmmDrivePath -Path $device -Volumes $volumes
+                if (-not $paths[$device]) { $paths[$device] = $device }
+            }
+            $paths[$device]
+        })
+        $list.Add(@{ Id = [int]$p.Id; Name = [string]$p.ProcessName; Path = $files[0]; Files = $files })
+    }
+    return $list
+}
+
+function Get-BsmmScreenCapturers {
+    $found = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+    $since = (Get-Date).AddDays(-1)
+    foreach ($capability in @('graphicsCaptureProgrammatic', 'graphicsCaptureWithoutBorder')) {
+        try {
+            $key = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey("Software\Microsoft\Windows\CurrentVersion\CapabilityAccessManager\ConsentStore\$capability\NonPackaged")
+            if (-not $key) { continue }
+            foreach ($name in $key.GetSubKeyNames()) {
+                $used = $key.OpenSubKey($name).GetValue('LastUsedTimeStart')
+                if ($used -and [DateTime]::FromFileTime([long]$used) -ge $since) { [void]$found.Add(($name -replace '#', '\')) }
+            }
+            $key.Close()
+        } catch {}
+    }
+    return ,$found
+}
+
+function Get-BsmmLoadContext {
+    $context = @{ Readers = @(); Overlays = @(); Capturers = (Get-BsmmScreenCapturers) }
+    try {
+        $targets = @(Get-RobloxTargetIds)
+        if ($targets.Count -gt 0 -and (Initialize-ExternalScanApi)) { $context.Readers = @([BSMM.ExternalScan]::FindRobloxMemoryReaders([int[]]$targets)) }
+    } catch {}
+    try {
+        if (Initialize-BsmmIntegrityApi) { $context.Overlays = @([BSMM.IntegrityScan]::FindTopmostOverlays() | ForEach-Object { [int](($_ -split '\|')[0]) }) }
+    } catch {}
+    return $context
+}
+
+$script:LoadSeen = $null
+$script:LoadHosts = $null
+$script:LoadedReport = New-Object System.Collections.Generic.List[object]
+function Get-LoadedFileAlerts {
+    param($Snapshot = $null, $Context = $null, [int]$Seconds = 45)
+    $alerts = New-Object System.Collections.Generic.List[string]
+    if ($null -eq $Snapshot) { $Snapshot = Get-BsmmLoadedFiles }
+    $programs = @($Snapshot | Where-Object { $_ })
+    $live = $null -ne $script:LoadSeen
+    if (-not $live) {
+        $script:LoadSeen = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+        $script:LoadHosts = New-Object 'System.Collections.Generic.HashSet[int]'
+    }
+
+    $fresh = @{}
+    foreach ($program in $programs) {
+        $owner = @{ Id = [int]$program.Id; Name = [string]$program.Name; Path = [string]$program.Path; Running = $script:LoadHosts.Contains([int]$program.Id) }
+        foreach ($file in @($program.Files)) {
+            if (-not $script:LoadSeen.Add("$($owner.Id)|$file") -or $file -ieq $owner.Path) { continue }
+            if (-not $fresh.ContainsKey($file)) { $fresh[$file] = New-Object System.Collections.Generic.List[object] }
+            $fresh[$file].Add($owner)
+        }
+    }
+    foreach ($program in $programs) { [void]$script:LoadHosts.Add([int]$program.Id) }
+
+    $zones = @{}
+    $queue = New-Object System.Collections.Generic.List[string]
+    $system = New-Object System.Collections.Generic.List[object]
+    foreach ($file in $fresh.Keys) {
+        $zones[$file] = Get-BsmmFileZone -Path $file
+        if ($zones[$file] -eq 'user') { $queue.Add($file) }
+        elseif ($zones[$file] -eq 'windows') {
+            $created = [datetime]::MinValue
+            try { $created = [IO.File]::GetCreationTimeUtc($file) } catch {}
+            $system.Add(@{ File = $file; Created = $created })
+        }
+    }
+    foreach ($item in @($system | Sort-Object { $_.Created } -Descending)) { $queue.Add($item.File) }
+
+    $clock = [Diagnostics.Stopwatch]::StartNew()
+    $findings = New-Object System.Collections.Generic.List[object]
+    $checked = 0
+    foreach ($file in $queue) {
+        if ($clock.Elapsed.TotalSeconds -gt $Seconds) { break }
+        $checked++
+        $trust = Get-BsmmFileTrust -Path $file
+        if ($trust.State -eq 'signed' -and (-not $live -or $zones[$file] -eq 'windows')) { continue }
+        $kind = ''
+        $owners = @{ $true = (New-Object System.Collections.Generic.List[object]); $false = (New-Object System.Collections.Generic.List[object]) }
+        foreach ($owner in $fresh[$file]) {
+            $ownerTrust = Get-BsmmFileTrust -Path $owner.Path
+            if ($ownerTrust.State -ne 'signed') { continue }
+            $found = Get-BsmmLoadKind -File $file -HostPath $owner.Path -Trust $trust -HostTrust $ownerTrust
+            if (-not $found -or ($found -eq 'signed') -or ($found -eq 'other' -and -not $owner.Running)) { continue }
+            $kind = $found
+            $owners[[bool]$owner.Running].Add($owner)
+        }
+        foreach ($running in @($true, $false)) {
+            if ($owners[$running].Count -gt 0) { $findings.Add(@{ File = $file; Kind = $kind; Signer = [string]$trust.Signer; Owners = $owners[$running]; Running = $running }) }
+        }
+    }
+
+    if ($findings.Count -gt 0 -and $null -eq $Context) { $Context = Get-BsmmLoadContext }
+    $matcher = $null
+    foreach ($finding in $findings) {
+        $file = $finding.File
+        $names = @($finding.Owners | ForEach-Object { $_.Name } | Select-Object -Unique)
+        $shown = @($names | Select-Object -First 3) -join ', '
+        if ($names.Count -gt 3) { $shown += " and $($names.Count - 3) more" }
+        $what = 'Unsigned file'
+        if ($finding.Kind -eq 'forged') { $what = "File with a copied signature ('$($finding.Signer)')" }
+        elseif ($finding.Kind -eq 'other') { $what = "File from another publisher ('$($finding.Signer)')" }
+        $where = "that does not belong to it is loaded in $shown"
+        if ($finding.Running) { $where = "was loaded into the already running $shown during the match" }
+        elseif ($live) { $where += ', started during the match' }
+
+        $why = New-Object System.Collections.Generic.List[string]
+        if ($finding.Kind -ne 'other') {
+            if ($finding.Kind -eq 'forged') { $why.Add('the file was changed after it was signed') }
+            $keyword = Get-BsmmCheatKeywordFast $file
+            if ($keyword) { $why.Add("named [$keyword]") }
+            try {
+                if (Initialize-BsmmForensics) {
+                    if (-not $matcher) { $matcher = [BSMM.Matcher]::new([string[]]$script:FpNeedles) }
+                    foreach ($reason in @(Get-BsmmFingerprintVerdict ([BSMM.Forensics]::FileNeedles($file, $matcher, 80MB)))) { $why.Add("contains $reason") }
+                }
+            } catch {}
+            if (@($finding.Owners | Where-Object { $Context.Readers -contains $_.Id }).Count -gt 0) { $why.Add('that program has Roblox open') }
+            if (@($finding.Owners | Where-Object { $Context.Overlays -contains $_.Id }).Count -gt 0) { $why.Add('that program draws an overlay on the screen') }
+            if (@($finding.Owners | Where-Object { $Context.Capturers -contains $_.Path }).Count -gt 0) { $why.Add('that program captured the screen in the last day') }
+            if ($script:LoadedReport.Count -lt 40) {
+                $hash = Get-BsmmProgramHash -Path $file
+                if ($hash) { $script:LoadedReport.Add(@{ path = (Limit-BsmmText (Protect-BsmmText $file) 300); host = $names[0]; hash = $hash }) }
+            }
+        }
+        $level = 'WARNING'
+        $note = ''
+        if ($why.Count -gt 0) { $level = 'FAILURE'; $note = " ($($why -join '; '))" }
+        $alerts.Add("${level}: $what $where$note -> $file")
+    }
+
+    $summary = "INFO: Checked $checked loaded files in $($programs.Count) running programs"
+    if ($queue.Count -gt $checked) { $summary += " ($($queue.Count - $checked) more were left at the time limit)" }
+    $alerts.Add($summary)
+    if ($findings.Count -eq 0) { $alerts.Insert(0, 'SUCCESS: Nothing is loaded inside a signed program that does not belong to it') }
+    return @($alerts | Select-Object -First 40)
 }
 
 $script:BenignStreams = '^(?i):(Zone\.Identifier|SmartScreen|com\.dropbox\.[^:]*|ms-properties|OECustomProperty|encryptable|favicon|AFP_AfpInfo|Win32App_1|KAVICHS|\$OBJECT_ID|CA_INOC|TASKICON):'
@@ -8508,7 +8712,6 @@ namespace BSMM
         [DllImport("kernel32.dll", CharSet = CharSet.Unicode)] static extern IntPtr GetModuleHandle(string name);
         [DllImport("kernel32.dll", CharSet = CharSet.Unicode)] static extern IntPtr LoadLibrary(string name);
 
-        // SYSTEM_CODEINTEGRITY_INFORMATION (class 103). 0xFFFFFFFF = query failed.
         public static uint CodeIntegrityOptions()
         {
             IntPtr b = Marshal.AllocHGlobal(8);
@@ -8523,7 +8726,6 @@ namespace BSMM
             finally { Marshal.FreeHGlobal(b); }
         }
 
-        // SYSTEM_KERNEL_DEBUGGER_INFORMATION (class 35) plus KUSER_SHARED_DATA.KdDebuggerEnabled.
         public static bool KernelDebuggerEnabled()
         {
             bool on = false;
@@ -8538,7 +8740,6 @@ namespace BSMM
             return on;
         }
 
-        // Live processes that answer by PID but are missing from the normal process list (DKOM hiding).
         public static int[] HiddenPids(int[] listed)
         {
             var set = new HashSet<int>(listed);
@@ -8558,7 +8759,6 @@ namespace BSMM
         static string Ip(uint a) { return (a & 0xFF) + "." + ((a >> 8) & 0xFF) + "." + ((a >> 16) & 0xFF) + "." + ((a >> 24) & 0xFF); }
         static int Port(int p) { return ((p & 0xFF) << 8) | ((p >> 8) & 0xFF); }
 
-        // IPv4 TCP table: "state|localIp|localPort|remoteIp|remotePort|pid" (state 2 = LISTEN, 5 = ESTABLISHED)
         public static string[] TcpTable()
         {
             var list = new List<string>();
@@ -8585,7 +8785,6 @@ namespace BSMM
             return list.ToArray();
         }
 
-        // Detects the classic AMSI / ETW "patch to return" tricks in THIS process.
         public static string ProloguePatch(string dll, string fn)
         {
             IntPtr m = GetModuleHandle(dll);
@@ -9002,7 +9201,7 @@ $script:SystemChecks = @(
     @{ Name = 'Service Memory Traces';        Caption = 'Reading program traces from service memory'; Run = { Get-ServiceMemoryTraceAlerts } },
     @{ Name = 'Code Fingerprints';            Caption = 'Looking inside programs for cheat code'; Run = { Get-CodeFingerprintAlerts } },
     @{ Name = 'Signature Forgery';            Caption = 'Checking for copied or borrowed signatures'; Run = { Get-SignatureForgeryAlerts } },
-    @{ Name = 'Injected Code';                Caption = 'Inspecting running programs for injected code'; Run = { Get-InjectedCodeAlerts } },
+    @{ Name = 'Injected Code';                Caption = 'Inspecting running programs for injected code'; Run = { @(Get-InjectedCodeAlerts; Get-LoadedFileAlerts) } },
     @{ Name = 'Hidden Data Streams';          Caption = 'Looking for programs hidden in data streams'; Run = { Get-HiddenStreamAlerts } },
     @{ Name = 'Download Origins';             Caption = 'Checking where downloads came from'; Run = { Get-DownloadOriginAlerts } },
     @{ Name = 'Windhawk';                     Caption = 'Checking Windhawk';                  Run = { Get-WindhawkStep1Alerts } },

@@ -500,12 +500,13 @@ const flaggedChecks = [
   { name: 'Gamma', lines: ['FAILURE: three'] },
 ];
 // A check of its own PC and player that ran the given programs; `flagged` gives it findings of its own.
-const pcReport = (relay, key, n, programs, flagged = false) => reported(relay, key, { roblox_id: String(3000 + n) }, {
+const pcReport = (relay, key, n, programs, flagged = false, extra = {}) => reported(relay, key, { roblox_id: String(3000 + n) }, {
   pc: pcOf(n),
   roblox: { userId: String(3000 + n), accounts: [{ id: String(3000 + n), sources: ['logs'] }], games: [] },
   clock: unix(),
   programs,
   ...(flagged ? { checks: flaggedChecks } : {}),
+  ...extra,
 });
 // The league's ordinary players: clean PCs running something everyone has.
 const cleanPcs = async (relay, key, from, count) => {
@@ -599,6 +600,55 @@ test('fingerprints are forgotten when they are older than the reports they came 
   const { detail } = await pcReport(relay, key, 2, [tool]);
   assert.deepEqual(flagCodes(detail), []);
   assert.equal(relay.sql('SELECT COUNT(*) AS n FROM program_sightings')[0].n, 1, 'only the new sighting is left');
+});
+
+// A file found loaded inside another program is reported apart from the programs that ran.
+const loadedInto = (name, host, letter = 'c') => ({ path: `C:\\Users\\kid\\AppData\\Local\\Temp\\${name}`, host, hash: hashOf(letter) });
+
+test('a file loaded inside another program is compared between PCs whatever it is called', async () => {
+  const relay = createRelay();
+  const { key } = await relay.tenant();
+  await cleanPcs(relay, key, 50, 5);
+
+  await pcReport(relay, key, 1, [], true, { loaded: [loadedInto('d3d9.dll', 'Discord.exe')] });
+  await pcReport(relay, key, 2, [], true, { loaded: [loadedInto('version.dll', 'steam.exe')] });
+  const third = await pcReport(relay, key, 3, [], false, { loaded: [loadedInto('discord_hook.dll', 'Discord.exe')] });
+  assert.deepEqual(flagCodes(third.detail), ['shared_program']);
+  assert.equal(third.detail.flags[0].level, 'WARN');
+  assert.match(third.detail.flags[0].text, /discord_hook\.dll in Discord\.exe \(2 other PCs, 2 flagged\)/);
+
+  await pcReport(relay, key, 4, [ran('C:\\Users\\kid\\Desktop\\tool.exe', 500, { hash: hashOf('c') })], true);
+  const fifth = await pcReport(relay, key, 5, [], false, { loaded: [loadedInto('x.dll', 'explorer.exe')] });
+  assert.equal(fifth.detail.flags.find((flag) => flag.code === 'shared_program').level, 'FAIL', 'the same file seen as a program on another PC counts too');
+});
+
+test('badly formed loaded files are ignored', async () => {
+  const relay = createRelay();
+  const { key } = await relay.tenant();
+  for (const loaded of ['nope', [null, 7, {}], [{ path: 'C:\\a.dll', host: 'a.exe', hash: 'short' }], [{ hash: hashOf('c') }]]) {
+    const { detail } = await pcReport(relay, key, 1, [], false, { loaded });
+    assert.deepEqual(flagCodes(detail), []);
+  }
+  assert.equal(relay.sql('SELECT COUNT(*) AS n FROM program_sightings')[0].n, 0, 'a fingerprint with no file name is not kept');
+});
+
+test('a file the live monitor sees loaded during a match is remembered for later checks', async () => {
+  const relay = createRelay();
+  const { key } = await relay.tenant();
+  await cleanPcs(relay, key, 50, 5);
+
+  for (const n of [1, 2]) {
+    const { check, session } = await relay.started(key, { mode: 'monitor', roblox_id: String(3000 + n) });
+    const live = (extra) => ({ v: '1.3.0', state: 'RUNNING', elapsed: 60, admin: true, counts: { fail: 0, warn: 0, info: 1 }, recent: [], roblox: report().roblox, pc: pcOf(n), ...extra });
+    assert.equal((await relay.send(session, live(), { path: '/v1/live', seq: 1 })).status, 200);
+    const seen = { counts: { fail: 2, warn: 0, info: 1 }, loaded: [loadedInto('helper.dll', 'Discord.exe'), { hash: 'nope' }] };
+    assert.equal((await relay.send(session, live(seen), { path: '/v1/live', seq: 2 })).status, 200);
+    assert.equal((await relay.send(session, live(seen), { path: '/v1/live', seq: 3 })).status, 200);
+    assert.equal(relay.sql('SELECT COUNT(*) AS n FROM program_sightings WHERE check_id = ?', check.id)[0].n, 1, 'kept once however often it is sent');
+  }
+
+  const { detail } = await pcReport(relay, key, 3, [], false, { loaded: [loadedInto('other.dll', 'chrome.exe')] });
+  assert.match(detail.flags.find((flag) => flag.code === 'shared_program').text, /other\.dll in chrome\.exe \(2 other PCs, 2 flagged\)/);
 });
 
 // ---------------------------------------------------------------- reading reports
