@@ -26,7 +26,7 @@ $script:Brand = @{
     Name    = 'BSMM'
     Product = 'Anti-Cheat'
     Mode    = 'Live monitor'
-    Version = '1.4.1'
+    Version = '1.4.2'
     Website = ''
 }
 
@@ -6683,7 +6683,7 @@ function Get-BsmmReportBody {
         roblox   = @{ userId = [string]$identity.userId; accounts = @($identity.accounts); games = @($identity.games) }
         pc       = [string](Get-BsmmPcFingerprint)
         programs = @(Get-BsmmProgramRuns)
-        loaded   = @($script:LoadedReport)
+        loaded   = $script:LoadedReport.ToArray()
     }
     $body.clock = Get-BsmmUnix
     return $body
