@@ -23,26 +23,26 @@ foreach ($__n in @(
 Clear-Host
 
 $script:Brand = @{
-    Name    = 'BSMM'
+    Name    = 'Mieru'
     Product = 'Anti-Cheat'
     Mode    = 'Live monitor'
-    Version = '1.4.2'
+    Version = '1.5.0'
     Website = ''
 }
 
 $script:Palette = @{
-    Brand1 = @{ Hex = '#8B5CF6'; Fallback = 'Magenta' }
-    Brand2 = @{ Hex = '#22D3EE'; Fallback = 'Cyan' }
-    Shadow = @{ Hex = '#4C3A8A'; Fallback = 'DarkMagenta' }
-    Text   = @{ Hex = '#F5F5F7'; Fallback = 'White' }
-    Body   = @{ Hex = '#C9C9D1'; Fallback = 'Gray' }
-    Muted  = @{ Hex = '#80808C'; Fallback = 'DarkGray' }
-    Line   = @{ Hex = '#3C3C48'; Fallback = 'DarkGray' }
-    Pass   = @{ Hex = '#34D399'; Fallback = 'Green' }
-    Warn   = @{ Hex = '#FBBF24'; Fallback = 'Yellow' }
-    Fail   = @{ Hex = '#FB4D6D'; Fallback = 'Red' }
-    Info   = @{ Hex = '#7AA2F7'; Fallback = 'DarkCyan' }
-    Ink    = @{ Hex = '#0E0E14'; Fallback = 'Black' }
+    Brand1 = @{ Hex = '#FF4FA3'; Fallback = 'Magenta' }
+    Brand2 = @{ Hex = '#FFC2E2'; Fallback = 'Magenta' }
+    Shadow = @{ Hex = '#8A2E63'; Fallback = 'DarkMagenta' }
+    Text   = @{ Hex = '#FFF5FA'; Fallback = 'White' }
+    Body   = @{ Hex = '#D9CAD3'; Fallback = 'Gray' }
+    Muted  = @{ Hex = '#8F7D88'; Fallback = 'DarkGray' }
+    Line   = @{ Hex = '#4A3442'; Fallback = 'DarkGray' }
+    Pass   = @{ Hex = '#5EE6A8'; Fallback = 'Green' }
+    Warn   = @{ Hex = '#FFC857'; Fallback = 'Yellow' }
+    Fail   = @{ Hex = '#FF6B4A'; Fallback = 'Red' }
+    Info   = @{ Hex = '#C4A7FF'; Fallback = 'DarkCyan' }
+    Ink    = @{ Hex = '#1A0D15'; Fallback = 'Black' }
 }
 
 $script:Report = @{
@@ -88,13 +88,14 @@ $script:G = @{
 }
 
 $script:LogoRows = @(
-    '######7 #######7###7   ###7###7   ###7',
-    '##F==##7##F====J####7 ####!####7 ####!',
-    '######FJ#######7##F####F##!##F####F##!',
-    '##F==##7L====##!##!L##FJ##!##!L##FJ##!',
-    '######FJ#######!##! L=J ##!##! L=J ##!',
-    'L=====J L======JL=J     L=JL=J     L=J'
+    '###7   ###7##7#######7######7 ##7   ##7',
+    '####7 ####!##!##F====J##F==##7##!   ##!',
+    '##F####F##!##!#####7  ######FJ##!   ##!',
+    '##!L##FJ##!##!##F==J  ##F==##7##!   ##!',
+    '##! L=J ##!##!#######7##!  ##!L######FJ',
+    'L=J     L=JL=JL======JL=J  L=J L=====J '
 )
+$script:LogoMap = @{ '#' = $script:G.Block; '=' = $script:G.DH; '!' = $script:G.DV; 'F' = $script:G.DTL; '7' = $script:G.DTR; 'L' = $script:G.DBL; 'J' = $script:G.DBR }
 
 $script:Steps = @('Live monitor')
 
@@ -121,9 +122,9 @@ foreach ($__k in @($script:Palette.Keys)) {
 }
 
 function Get-BsmmGradient {
-    param([double]$T)
+    param([double]$T, [string]$From = 'Brand1', [string]$To = 'Brand2')
     if ($T -lt 0) { $T = 0 } elseif ($T -gt 1) { $T = 1 }
-    $a = $script:Rgb['Brand1']; $b = $script:Rgb['Brand2']
+    $a = $script:Rgb[$From]; $b = $script:Rgb[$To]
     return @(
         [int]($a[0] + ($b[0] - $a[0]) * $T),
         [int]($a[1] + ($b[1] - $a[1]) * $T),
@@ -141,6 +142,8 @@ public static extern IntPtr GetStdHandle(int nStdHandle);
 public static extern bool GetConsoleMode(IntPtr hConsoleHandle, out uint lpMode);
 [DllImport("kernel32.dll", SetLastError = true)]
 public static extern bool SetConsoleMode(IntPtr hConsoleHandle, uint dwMode);
+[DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+public static extern bool WriteConsoleW(IntPtr hConsoleOutput, string lpBuffer, uint nNumberOfCharsToWrite, out uint lpNumberOfCharsWritten, IntPtr lpReserved);
 '@ -ErrorAction Stop
         }
     } catch {}
@@ -258,7 +261,13 @@ function Out-Badge {
 
 function Out-Rule {
     param([string]$Token = 'Line')
-    Out-Seg ('  ' + ($script:G.H * $script:UiWidth)) -Fg $Token
+    if (-not $script:UseAnsi -or $Token -ne 'Line') { Out-Seg ('  ' + ($script:G.H * $script:UiWidth)) -Fg $Token; return }
+    $sb = New-Object System.Text.StringBuilder
+    [void]$sb.Append('  ')
+    for ($i = 0; $i -lt $script:UiWidth; $i++) {
+        [void]$sb.Append((Get-BsmmFg (Get-BsmmGradient ($i / [double]$script:UiWidth) 'Shadow' 'Line'))).Append($script:G.H)
+    }
+    Write-Host $sb.Append($script:AnsiReset).ToString()
 }
 
 function Out-Heading {
@@ -346,8 +355,91 @@ function Out-Card {
     Out-Seg ('  ' + $script:G.BL + ($script:G.H * ($W - 2)) + $script:G.BR) -Fg $Accent
 }
 
+function Get-BsmmLogoColors {
+    param([double]$Phase)
+    $colors = New-Object string[] ($script:LogoRows[0].Length + $script:LogoRows.Count)
+    for ($d = 0; $d -lt $colors.Length; $d++) {
+        $colors[$d] = Get-BsmmFg (Get-BsmmGradient (0.5 - 0.5 * [Math]::Cos(2 * [Math]::PI * ($d / [double]$colors.Length - $Phase))))
+    }
+    return ,$colors
+}
+
+function Get-BsmmLogoRow {
+    param([int]$Row, [string[]]$Colors)
+    if (-not $script:LogoTemplates) {
+        $script:LogoTemplates = @(for ($r = 0; $r -lt $script:LogoRows.Count; $r++) {
+            $text = $script:LogoRows[$r]
+            $sb = New-Object System.Text.StringBuilder
+            for ($i = 0; $i -lt $text.Length; $i++) {
+                $ch = [string]$text[$i]
+                if ($ch -eq ' ') { [void]$sb.Append(' ') }
+                elseif ($ch -eq '#') { [void]$sb.Append('{').Append($i + $r).Append('}').Append($script:G.Block) }
+                else { [void]$sb.Append($script:AnsiFg['Shadow']).Append($script:LogoMap[$ch]) }
+            }
+            $sb.Append($script:AnsiReset).ToString()
+        })
+    }
+    return [string]::Format($script:LogoTemplates[$Row], [object[]]$Colors)
+}
+
+function Get-BsmmLogoFrames {
+    param([int]$Top)
+    $base = Get-BsmmLogoColors -Phase 0
+    $count = $base.Length
+    $colors = New-Object string[] $count
+    $frames = New-Object string[] $count
+    for ($f = 0; $f -lt $count; $f++) {
+        [Array]::Copy($base, $count - $f, $colors, 0, $f)
+        [Array]::Copy($base, 0, $colors, $f, $count - $f)
+        $sb = New-Object System.Text.StringBuilder
+        [void]$sb.Append($script:Esc + '7')
+        for ($r = 0; $r -lt $script:LogoRows.Count; $r++) {
+            [void]$sb.Append("$script:Esc[$($Top + $r);3H").Append((Get-BsmmLogoRow -Row $r -Colors $colors))
+        }
+        $frames[$f] = $sb.Append($script:Esc + '8').ToString()
+    }
+    return ,$frames
+}
+
+$script:LogoTemplates = $null
+$script:LogoAnimation = $null
+$script:LogoAnimator = @'
+param($id, $frames, $top)
+$out = [BSMM.ConsoleApi]::GetStdHandle(-11)
+$i = 0
+try {
+    while ([AppDomain]::CurrentDomain.GetData('BsmmLogo') -eq $id -and [Console]::WindowTop -eq 0 -and [Console]::CursorTop -ge $top + 5 -and [Console]::CursorTop -lt [Console]::WindowHeight - 1) {
+        $frame = $frames[$i % $frames.Length]
+        [uint32]$written = 0
+        [void][BSMM.ConsoleApi]::WriteConsoleW($out, $frame, [uint32]$frame.Length, [ref]$written, [IntPtr]::Zero)
+        $i++
+        [Threading.Thread]::Sleep(70)
+    }
+} catch {}
+'@
+
+function Stop-BsmmLogoAnimation {
+    if (-not $script:LogoAnimation) { return }
+    try { [AppDomain]::CurrentDomain.SetData('BsmmLogo', $null); $script:LogoAnimation.Stop(); $script:LogoAnimation.Dispose() } catch {}
+    $script:LogoAnimation = $null
+}
+
+function Start-BsmmLogoAnimation {
+    param([int]$Top)
+    Stop-BsmmLogoAnimation
+    if (-not $script:UseAnsi) { return }
+    try {
+        if ([Console]::IsOutputRedirected) { return }
+        $id = [guid]::NewGuid().ToString()
+        [AppDomain]::CurrentDomain.SetData('BsmmLogo', $id)
+        $shell = [powershell]::Create()
+        [void]$shell.AddScript($script:LogoAnimator).AddArgument($id).AddArgument((Get-BsmmLogoFrames -Top $Top)).AddArgument($Top)
+        [void]$shell.BeginInvoke()
+        $script:LogoAnimation = $shell
+    } catch {}
+}
+
 function Show-BsmmLogo {
-    $map = @{ '#' = $script:G.Block; '=' = $script:G.DH; '!' = $script:G.DV; 'F' = $script:G.DTL; '7' = $script:G.DTR; 'L' = $script:G.DBL; 'J' = $script:G.DBR }
     $side = @{}
     $side[1] = @{ Text = ($script:Brand.Product.ToUpper()); Fg = 'Text'; Bold = $true }
     $side[2] = @{ Text = $script:Brand.Mode; Fg = 'Body'; Bold = $false }
@@ -355,24 +447,12 @@ function Show-BsmmLogo {
     if ($script:Brand.Website) { $ver += "  $($script:G.Mid)  $($script:Brand.Website)" }
     $side[3] = @{ Text = $ver; Fg = 'Muted'; Bold = $false }
 
-    $width = $script:LogoRows[0].Length
+    $colors = $null
+    if ($script:UseAnsi) { $colors = Get-BsmmLogoColors -Phase 0 }
     for ($r = 0; $r -lt $script:LogoRows.Count; $r++) {
         $row = $script:LogoRows[$r]
         if ($script:UseAnsi) {
-            $sb = New-Object System.Text.StringBuilder
-            [void]$sb.Append('  ')
-            for ($i = 0; $i -lt $row.Length; $i++) {
-                $ch = [string]$row[$i]
-                if ($ch -eq ' ') { [void]$sb.Append(' '); continue }
-                if ($ch -eq '#') {
-                    $t = (($i / [double]($width - 1)) * 0.85) + (($r / 5.0) * 0.15)
-                    [void]$sb.Append((Get-BsmmFg (Get-BsmmGradient $t))).Append($script:G.Block)
-                } else {
-                    [void]$sb.Append($script:AnsiFg['Shadow']).Append($map[$ch])
-                }
-            }
-            [void]$sb.Append($script:AnsiReset)
-            Write-Host $sb.ToString() -NoNewline
+            Write-Host ('  ' + (Get-BsmmLogoRow -Row $r -Colors $colors)) -NoNewline
         } else {
             Write-Host '  ' -NoNewline
             $i = 0
@@ -381,7 +461,7 @@ function Show-BsmmLogo {
                 $buf = ''
                 while ($i -lt $row.Length -and (($row[$i] -eq '#') -eq $isBlock)) {
                     $c = [string]$row[$i]
-                    if ($c -eq ' ') { $buf += ' ' } else { $buf += $map[$c] }
+                    if ($c -eq ' ') { $buf += ' ' } else { $buf += $script:LogoMap[$c] }
                     $i++
                 }
                 $tok = 'Shadow'; if ($isBlock) { $tok = 'Brand1' }
@@ -437,9 +517,13 @@ function Show-SessionMeta {
 
 function Write-StepHeader {
     param([int]$Step = 1, [switch]$NoClear)
+    Stop-BsmmLogoAnimation
     if (-not $NoClear) { Clear-Host }
     Out-Seg ''
+    $top = 0
+    try { $top = [Console]::CursorTop + 1 } catch {}
     Show-BsmmLogo
+    if (-not $NoClear -and $top -gt 0) { Start-BsmmLogoAnimation -Top $top }
     Out-Seg ''
     Show-StepTracker -Current $Step
     Out-Rule
@@ -3830,7 +3914,7 @@ function Get-CommandHistoryAlerts {
         foreach ($rule in $script:AntiForensicCommandPatterns) {
             $hits = @($src.Lines | Where-Object { $_ -match "(?i)$($rule.Pattern)" } | Select-Object -Unique | Select-Object -First 3)
             foreach ($hit in $hits) {
-                if ($hit -match '(?i)bsmm_security_events|ror_security_events|BSMM v\d|RoR v\d') { continue }
+                if ($hit -match '(?i)bsmm_security_events|ror_security_events|BSMM v\d|Mieru v\d|RoR v\d') { continue }
                 $snippet = ($hit -replace '\s+', ' ').Trim()
                 if ($snippet.Length -gt 140) { $snippet = $snippet.Substring(0, 140) + '...' }
                 $alerts += "$($rule.Level): $($rule.Label) in $($src.Name) -> $snippet"
@@ -9404,7 +9488,7 @@ Out-Card -Title 'Keep this window open' -Lines @(
 Out-Seg ''
 Out-TaggedText -Indent '  ' -Tag 'NOTE' -Text 'Starting up (about a minute)...' -TextToken 'Muted'
 
-Write-MonitorAlert -Message "BSMM v$($script:BsmmVersion) live monitor started" -Level INFO
+Write-MonitorAlert -Message "Mieru v$($script:BsmmVersion) live monitor started" -Level INFO
 [void](Send-BsmmLiveUpdate -Since (Get-Date))
 
 $usbMonitoringAvailable = $false
@@ -9418,7 +9502,7 @@ try {
 }
 
 trap {
-    Write-MonitorAlert -Message "BSMM monitor error ($($_.Exception.Message))" -Color Yellow
+    Write-MonitorAlert -Message "Mieru monitor error ($($_.Exception.Message))" -Color Yellow
     break
 }
 
@@ -9836,9 +9920,10 @@ while ($true) {
     }
 }
 } finally {
+    Stop-BsmmLogoAnimation
     Clear-MonitorStatusLine
     $elapsed = (Get-Date) - $monitoringStart
-    Write-MonitorAlert -Message ("BSMM monitor stopped after {0:hh\:mm\:ss} ({1} fail, {2} warn, {3} info)" -f $elapsed, $script:MonitorAlertCounts.FAIL, $script:MonitorAlertCounts.WARN, $script:MonitorAlertCounts.INFO) -Level INFO
+    Write-MonitorAlert -Message ("Mieru monitor stopped after {0:hh\:mm\:ss} ({1} fail, {2} warn, {3} info)" -f $elapsed, $script:MonitorAlertCounts.FAIL, $script:MonitorAlertCounts.WARN, $script:MonitorAlertCounts.INFO) -Level INFO
     Get-EventSubscriber -SourceIdentifier USBChange -ErrorAction SilentlyContinue |
         Unregister-Event -Force -ErrorAction SilentlyContinue
 

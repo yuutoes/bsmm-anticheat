@@ -1,4 +1,4 @@
-# BSMM Anti-Cheat
+# Mieru
 
 The recording check for BSMM matches.
 

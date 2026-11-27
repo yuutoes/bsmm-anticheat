@@ -819,7 +819,7 @@ async function readCheck(env, tenant, id) {
 
 async function postDiscord(check, payload, file = null, editId = null) {
   if (!check.webhook_url) return null;
-  const body = { username: 'BSMM Anti-Cheat', ...payload, allowed_mentions: { parse: [] } };
+  const body = { username: 'Mieru', ...payload, allowed_mentions: { parse: [] } };
   let init;
   if (file) {
     const form = new FormData();
