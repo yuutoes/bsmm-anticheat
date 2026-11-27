@@ -100,6 +100,8 @@ test('the fixed start command asks for the code, then loads that check', async (
   assert.match(start.text, /Read-Host/);
   assert.ok(start.text.includes('irm "https://relay.test/c/$code" | iex'));
   assert.ok(!/Key =|SystemChecks/.test(start.text), 'the start script holds no session and no checks');
+  const guard = start.text.indexOf('Is64BitProcess');
+  assert.ok(guard >= 0 && guard < start.text.indexOf('Read-Host'), '32-bit PowerShell is turned away before the code is asked for');
 
   const browser = await relay.call('GET', '/run', { headers: { 'user-agent': 'Mozilla/5.0 Chrome/130.0' } });
   assert.ok(!browser.text.includes('Read-Host'));

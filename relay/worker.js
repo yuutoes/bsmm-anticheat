@@ -265,6 +265,7 @@ const notPowerShell = (request) => (/powershell/i.test(request.headers.get('user
 // It is the same for everyone, so it holds no session and says nothing about the checks.
 function startScript(request, origin) {
   const lines = [
+    "if ([Environment]::Is64BitOperatingSystem -and -not [Environment]::Is64BitProcess) { Write-Host 'This is the 32-bit Windows PowerShell (x86), and the check cannot run in it. Close this window, open Windows PowerShell or Terminal (not the one marked x86) as administrator and paste the command again.' -ForegroundColor Yellow; return }",
     "$code = ((Read-Host 'Paste the code BSMM staff gave you, then press Enter') -replace '[^A-Za-z0-9]', '').ToUpper()",
     `if ($code) { irm "${origin}/c/$code" | iex } else { Write-Host 'No code entered. Run the command again when you have your code.' -ForegroundColor Yellow }`,
   ];

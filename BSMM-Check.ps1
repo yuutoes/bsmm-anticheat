@@ -26,7 +26,7 @@ $script:Brand = @{
     Name    = 'Mieru'
     Product = 'Anti-Cheat'
     Mode    = 'PC check'
-    Version = '1.5.0'
+    Version = '1.5.1'
     Website = ''
 }
 
@@ -68,6 +68,15 @@ if (-not ($script:Session -is [hashtable]) -or
     Microsoft.PowerShell.Utility\Write-Host ''
     Microsoft.PowerShell.Utility\Write-Host '  This check only runs with a one-time code from BSMM staff.' -ForegroundColor Yellow
     Microsoft.PowerShell.Utility\Write-Host '  Ask staff for a new code, run the command again and enter it.' -ForegroundColor Yellow
+    Microsoft.PowerShell.Utility\Write-Host ''
+    return
+}
+
+if ([Environment]::Is64BitOperatingSystem -and -not [Environment]::Is64BitProcess) {
+    Microsoft.PowerShell.Utility\Write-Host ''
+    Microsoft.PowerShell.Utility\Write-Host '  This is the 32-bit Windows PowerShell (x86). The check cannot run in it.' -ForegroundColor Yellow
+    Microsoft.PowerShell.Utility\Write-Host '  Ask BSMM staff for a new code, then open Windows PowerShell or Terminal (not the one marked x86)' -ForegroundColor Yellow
+    Microsoft.PowerShell.Utility\Write-Host '  as administrator and run the command there.' -ForegroundColor Yellow
     Microsoft.PowerShell.Utility\Write-Host ''
     return
 }
@@ -5867,6 +5876,7 @@ $script:JournalPrefetch = $null
 function Add-BsmmRun {
     param($Runs, [string]$Path, $Time, [string]$Source, [int]$Count = 0)
     if (-not $Path -or -not ($Time -is [datetime]) -or $Time.Year -lt 2015 -or $Time -gt (Get-Date).AddDays(1)) { return }
+    if ($Path -match '^\\\\\?\\[A-Za-z]:\\') { $Path = $Path.Substring(4) }
     $Runs.Add([pscustomobject]@{ Path = $Path; Time = $Time; Source = $Source; Runs = $Count })
 }
 
